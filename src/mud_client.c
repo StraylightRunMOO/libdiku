@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <glob.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static area_t *g_areas = NULL;
 static area_t *g_start_area = NULL;
@@ -73,15 +74,21 @@ static char *lowercase(const char *str)
 static bool name_matches(const char *name, const char *keyword)
 {
     if (!name || !keyword) return false;
-    char nbuf[256], kbuf[256];
+    char nbuf[256], kbuf[256], klwr[256];
     strncpy(nbuf, name, sizeof(nbuf) - 1);
     nbuf[sizeof(nbuf) - 1] = '\0';
     strncpy(kbuf, keyword, sizeof(kbuf) - 1);
     kbuf[sizeof(kbuf) - 1] = '\0';
     
+    {
+        char *tmp = lowercase(kbuf);
+        strncpy(klwr, tmp, sizeof(klwr) - 1);
+        klwr[sizeof(klwr) - 1] = '\0';
+    }
+    
     char *ntok = strtok(nbuf, " ");
     while (ntok) {
-        if (strstr(lowercase(ntok), lowercase(kbuf)) != NULL)
+        if (strstr(lowercase(ntok), klwr) != NULL)
             return true;
         ntok = strtok(NULL, " ");
     }
@@ -310,11 +317,95 @@ static void move_dir(int dir)
     look_room();
 }
 
+static room_t *find_room_containing_vnum(int vnum)
+{
+    for (area_t *a = g_areas; a; a = a->next) {
+        for (int i = 0; i < a->room_count; i++) {
+            room_t *r = &a->rooms[i];
+            for (int j = 0; j < r->room_item_count; j++) {
+                if (r->room_items[j]->vnum == vnum) return r;
+            }
+            for (int j = 0; j < r->room_mobile_count; j++) {
+                mobile_t *mob = r->room_mobiles[j];
+                if (mob->vnum == vnum) return r;
+                for (int k = 0; k < mob->inventory_count; k++) {
+                    if (mob->inventory[k].item->vnum == vnum) return r;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static void cmd_go(const char *arg)
+{
+    while (*arg && isspace((unsigned char)*arg)) arg++;
+    if (!arg[0]) {
+        printf("Usage: @go #<vnum>\n");
+        return;
+    }
+    
+    if (arg[0] == '#') arg++;
+    char *endptr;
+    long vnum_l = strtol(arg, &endptr, 10);
+    if (*endptr != '\0' && !isspace((unsigned char)*endptr)) {
+        printf("Usage: @go #<vnum>\n");
+        return;
+    }
+    int vnum = (int)vnum_l;
+    
+    room_t *target = diku_find_room_global(g_areas, vnum);
+    if (!target) {
+        target = find_room_containing_vnum(vnum);
+    }
+    
+    if (!target) {
+        printf("No such room or entity.\n");
+        return;
+    }
+    
+    g_room = target;
+    printf("You are transported to...\n");
+    print_separator();
+    look_room();
+}
+
+static void cmd_zap(void)
+{
+    int total = 0;
+    for (area_t *a = g_areas; a; a = a->next) {
+        total += a->room_count;
+    }
+    if (total == 0) {
+        printf("No rooms to zap to!\n");
+        return;
+    }
+    
+    int idx = rand() % total;
+    room_t *target = NULL;
+    for (area_t *a = g_areas; a; a = a->next) {
+        if (idx < a->room_count) {
+            target = &a->rooms[idx];
+            break;
+        }
+        idx -= a->room_count;
+    }
+    
+    if (target) {
+        g_room = target;
+        printf("*ZAP* You have been transported to a random location!\n");
+        print_separator();
+        look_room();
+    }
+}
+
 static void print_help(void)
 {
     printf("Commands:\n");
     printf("  n, s, e, w, ne, nw, se, sw, u, d, in, out  Move in a direction\n");
     printf("  look [target]    Look at the room or something in it (alias: l)\n");
+    printf("  @go #<vnum>      Teleport to a room (or room containing vnum)\n");
+    printf("  zap              Teleport to a random room\n");
     printf("  help             Show this help\n");
     printf("  quit, q          Exit\n");
 }
@@ -350,6 +441,16 @@ static void process_cmd(char *cmd)
     }
     if (strcmp(cmd, "look") == 0 || strcmp(cmd, "l") == 0) {
         look_room();
+        return;
+    }
+    
+    if (strcmp(cmd, "zap") == 0) {
+        cmd_zap();
+        return;
+    }
+    
+    if (strncmp(cmd, "@go", 3) == 0) {
+        cmd_go(cmd + 3);
         return;
     }
     
@@ -395,6 +496,8 @@ int main(int argc, char *argv[])
         area_count++;
         total_rooms += a->room_count;
     }
+    
+    srand((unsigned)time(NULL));
     
     printf("Welcome to the DikuMUD Area Explorer!\n");
     printf("Loaded %d area(s) with %d total rooms.\n", area_count, total_rooms);

@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 typedef enum {
     PAGE_NEXT,
@@ -27,168 +29,211 @@ static page_action_t pager_prompt(const char *category_name, int current, int to
 
 static void print_usage(const char *prog)
 {
-    printf("Usage: %s <area_file.are> [options]\n", prog);
+    printf("Usage: %s <path> [options]\n", prog);
+    printf("\nPath can be:\n");
+    printf("  <area_file.are>     A single area file\n");
+    printf("  <package_base>      Base path to a classic .wld/.mob/.obj/.zon package\n");
+    printf("  <directory>         Load all .are files (or packages with --packages)\n");
     printf("\nOptions:\n");
-    printf("  -v, --verbose   Verbose mode: page through selected entities\n");
-    printf("  --all           Select all entities (default with -v)\n");
-    printf("  --rooms         Select rooms\n");
-    printf("  --mobiles       Select mobiles\n");
-    printf("  --objects       Select objects/items\n");
-    printf("  --graph         Select graph connections\n");
-    printf("  --coords        Select 3D coordinates\n");
-    printf("  --symmetry      Show exit symmetry report\n");
-    printf("  -h, --help      Show this help\n");
+    printf("  -v, --verbose       Verbose mode: page through selected entities\n");
+    printf("  --all               Select all entities (default with -v)\n");
+    printf("  --rooms             Select rooms\n");
+    printf("  --mobiles           Select mobiles\n");
+    printf("  --objects           Select objects/items\n");
+    printf("  --graph             Select graph connections\n");
+    printf("  --coords            Select 3D coordinates\n");
+    printf("  --symmetry          Show exit symmetry report\n");
+    printf("  --packages          When loading a directory, load multi-file packages\n");
+    printf("  -h, --help          Show this help\n");
     printf("\nWithout -v, an overview summary is printed.\n");
 }
 
-static void print_overview(area_t *area)
+static bool is_directory(const char *path)
 {
-    diku_format_t fmt = diku_detect_format(area);
-    room_t *central = diku_find_central_room(area);
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    return S_ISDIR(st.st_mode);
+}
 
-    int total_exits = 0;
-    int resolved_exits = 0;
-    for (int i = 0; i < area->room_count; i++) {
-        for (int d = 0; d < DIKU_MAX_EXITS; d++) {
-            if (area->rooms[i].exits[d] && area->rooms[i].exits[d]->to_vnum > 0) {
-                total_exits++;
-                if (area->rooms[i].exits[d]->to_room) {
-                    resolved_exits++;
+static void progress_cb(const char *op, int cur, int total, const char *detail, void *user)
+{
+    (void)user;
+    if (total > 0) {
+        fprintf(stderr, "\r[%s] %d/%d %s", op, cur + 1, total, detail ? detail : "");
+        if (cur + 1 >= total) fprintf(stderr, "\n");
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[%s] %s\n", op, detail ? detail : "");
+    }
+}
+
+static void print_overview(area_t *areas, const char *source)
+{
+    int total_areas = 0, total_rooms = 0, total_mobiles = 0, total_items = 0;
+    int total_exits = 0, total_resolved = 0;
+    int sym_total = 0, sym_asymmetric = 0;
+
+    for (area_t *a = areas; a; a = a->next) {
+        total_areas++;
+        total_rooms += a->room_count;
+        total_mobiles += a->mobile_count;
+        total_items += a->item_count;
+
+        for (int i = 0; i < a->room_count; i++) {
+            for (int d = 0; d < DIKU_MAX_EXITS; d++) {
+                exit_t *e = a->rooms[i].exits[d];
+                if (e && e->to_vnum > 0) {
+                    total_exits++;
+                    if (e->to_room) total_resolved++;
                 }
             }
         }
+
+        int t = 0, asym = 0;
+        diku_check_exit_symmetry(a, &t, &asym);
+        sym_total += t;
+        sym_asymmetric += asym;
     }
 
-    int min_x, max_x, min_y, max_y, min_z, max_z;
-    diku_get_coord_bounds(area, &min_x, &max_x, &min_y, &max_y, &min_z, &max_z);
-    int diameter = diku_graph_diameter(area);
-    int sym_total = 0, sym_asymmetric = 0;
-    diku_check_exit_symmetry(area, &sym_total, &sym_asymmetric);
+    printf("============================================================\n");
+    printf("Source: %s\n", source);
+    printf("Areas loaded: %d\n", total_areas);
+    printf("============================================================\n");
+    printf("Total Rooms:    %d\n", total_rooms);
+    printf("Total Mobiles:  %d\n", total_mobiles);
+    printf("Total Objects:  %d\n", total_items);
+    printf("Total Exits:    %d (%.1f%% resolved)\n",
+           total_exits, total_exits > 0 ? (100.0 * total_resolved / total_exits) : 0.0);
+    printf("Symmetry:       %d/%d asymmetric exits\n", sym_asymmetric, sym_total);
+    printf("============================================================\n");
 
-    printf("============================================================\n");
-    printf("Area Overview: %s\n", area->filename.str ? area->filename.str : "(unknown)");
-    printf("============================================================\n");
-    printf("Format:     %s\n", diku_format_name(fmt));
-    printf("Name:       %s\n", area->name.str ? area->name.str : "(unnamed)");
-    printf("Builders:   %s\n", area->builders.str ? area->builders.str : "(none)");
-    if (area->credits.str && area->credits.len > 0) {
-        printf("Credits:    %s\n", area->credits.str);
+    for (area_t *a = areas; a; a = a->next) {
+        printf("  %-30s  R:%4d  M:%4d  O:%4d\n",
+               a->name.str && a->name.len > 0 ? a->name.str : "(unnamed)",
+               a->room_count, a->mobile_count, a->item_count);
     }
-    if (area->low_level > 0 || area->high_level > 0) {
-        printf("Levels:     %d - %d\n", area->low_level, area->high_level);
-    }
-    if (area->low_vnum > 0 || area->high_vnum > 0) {
-        printf("Vnums:      %d - %d\n", area->low_vnum, area->high_vnum);
-    }
-    if (area->security > 0) {
-        printf("Security:   %d\n", area->security);
-    }
-    if (area->version > 0) {
-        printf("Version:    %d\n", area->version);
-    }
-    printf("\n");
-    printf("Entities:\n");
-    printf("  Rooms:    %d\n", area->room_count);
-    printf("  Mobiles:  %d\n", area->mobile_count);
-    printf("  Objects:  %d\n", area->item_count);
-    printf("  Exits:    %d (%.1f%% resolved)\n",
-           total_exits, total_exits > 0 ? (100.0 * resolved_exits / total_exits) : 0.0);
-    printf("\n");
-    printf("Coordinates:\n");
-    printf("  Bounds:   X[%d,%d] Y[%d,%d] Z[%d,%d]\n",
-           min_x, max_x, min_y, max_y, min_z, max_z);
-    printf("  Central:  #%d - %s\n",
-           central ? central->vnum : -1,
-           central ? (central->name.str ? central->name.str : "(unnamed)") : "(none)");
-    printf("  Diameter: %d\n", diameter);
-    printf("  Symmetry: %d/%d asymmetric exits\n", sym_asymmetric, sym_total);
     printf("============================================================\n");
 }
 
-static bool page_rooms(area_t *area)
+static bool page_rooms(area_t *areas)
 {
-    if (area->room_count == 0) {
+    int total = 0;
+    for (area_t *a = areas; a; a = a->next) total += a->room_count;
+
+    if (total == 0) {
         printf("\n--- Rooms (0) ---\n");
         return false;
     }
-    printf("\n--- Rooms (%d) ---\n", area->room_count);
-    for (int i = 0; i < area->room_count; i++) {
-        printf("\n");
-        diku_print_room(&area->rooms[i]);
-        page_action_t action = pager_prompt("Room", i + 1, area->room_count);
-        if (action == PAGE_QUIT) return true;
-        if (action == PAGE_SKIP_CATEGORY) return false;
+    printf("\n--- Rooms (%d) ---\n", total);
+
+    int idx = 0;
+    for (area_t *a = areas; a; a = a->next) {
+        for (int i = 0; i < a->room_count; i++) {
+            printf("\n");
+            diku_print_room(&a->rooms[i]);
+            page_action_t action = pager_prompt("Room", ++idx, total);
+            if (action == PAGE_QUIT) return true;
+            if (action == PAGE_SKIP_CATEGORY) return false;
+        }
     }
     return false;
 }
 
-static bool page_mobiles(area_t *area)
+static bool page_mobiles(area_t *areas)
 {
-    if (area->mobile_count == 0) {
+    int total = 0;
+    for (area_t *a = areas; a; a = a->next) total += a->mobile_count;
+
+    if (total == 0) {
         printf("\n--- Mobiles (0) ---\n");
         return false;
     }
-    printf("\n--- Mobiles (%d) ---\n", area->mobile_count);
-    for (int i = 0; i < area->mobile_count; i++) {
-        printf("\n");
-        diku_print_mobile(&area->mobiles[i]);
-        page_action_t action = pager_prompt("Mobile", i + 1, area->mobile_count);
-        if (action == PAGE_QUIT) return true;
-        if (action == PAGE_SKIP_CATEGORY) return false;
+    printf("\n--- Mobiles (%d) ---\n", total);
+
+    int idx = 0;
+    for (area_t *a = areas; a; a = a->next) {
+        for (int i = 0; i < a->mobile_count; i++) {
+            printf("\n");
+            diku_print_mobile(&a->mobiles[i]);
+            page_action_t action = pager_prompt("Mobile", ++idx, total);
+            if (action == PAGE_QUIT) return true;
+            if (action == PAGE_SKIP_CATEGORY) return false;
+        }
     }
     return false;
 }
 
-static bool page_objects(area_t *area)
+static bool page_objects(area_t *areas)
 {
-    if (area->item_count == 0) {
+    int total = 0;
+    for (area_t *a = areas; a; a = a->next) total += a->item_count;
+
+    if (total == 0) {
         printf("\n--- Objects (0) ---\n");
         return false;
     }
-    printf("\n--- Objects (%d) ---\n", area->item_count);
-    for (int i = 0; i < area->item_count; i++) {
-        printf("\n");
-        diku_print_item(&area->items[i]);
-        page_action_t action = pager_prompt("Object", i + 1, area->item_count);
-        if (action == PAGE_QUIT) return true;
-        if (action == PAGE_SKIP_CATEGORY) return false;
+    printf("\n--- Objects (%d) ---\n", total);
+
+    int idx = 0;
+    for (area_t *a = areas; a; a = a->next) {
+        for (int i = 0; i < a->item_count; i++) {
+            printf("\n");
+            diku_print_item(&a->items[i]);
+            page_action_t action = pager_prompt("Object", ++idx, total);
+            if (action == PAGE_QUIT) return true;
+            if (action == PAGE_SKIP_CATEGORY) return false;
+        }
     }
     return false;
 }
 
-static bool page_graph(area_t *area)
+static bool page_graph(area_t *areas)
 {
-    if (area->room_count == 0) {
+    int total = 0;
+    for (area_t *a = areas; a; a = a->next) total += a->room_count;
+
+    if (total == 0) {
         printf("\n--- Graph (0 rooms) ---\n");
         return false;
     }
-    printf("\n--- Graph Connections (%d rooms) ---\n", area->room_count);
-    for (int i = 0; i < area->room_count; i++) {
-        printf("\n");
-        diku_print_room(&area->rooms[i]);
-        page_action_t action = pager_prompt("Graph", i + 1, area->room_count);
-        if (action == PAGE_QUIT) return true;
-        if (action == PAGE_SKIP_CATEGORY) return false;
+    printf("\n--- Graph Connections (%d rooms) ---\n", total);
+
+    int idx = 0;
+    for (area_t *a = areas; a; a = a->next) {
+        for (int i = 0; i < a->room_count; i++) {
+            printf("\n");
+            diku_print_room(&a->rooms[i]);
+            page_action_t action = pager_prompt("Graph", ++idx, total);
+            if (action == PAGE_QUIT) return true;
+            if (action == PAGE_SKIP_CATEGORY) return false;
+        }
     }
     return false;
 }
 
-static bool page_coords(area_t *area)
+static bool page_coords(area_t *areas)
 {
     printf("\n--- 3D Coordinates ---\n\n");
-    diku_print_coordinates(area);
-    printf("\n");
+    for (area_t *a = areas; a; a = a->next) {
+        printf("Area: %s\n", a->name.str ? a->name.str : "(unnamed)");
+        diku_print_coordinates(a);
+        printf("\n");
+    }
     page_action_t action = pager_prompt("Coords", 1, 1);
     if (action == PAGE_QUIT) return true;
     return false;
 }
 
-static bool page_symmetry(area_t *area)
+static bool page_symmetry(area_t *areas)
 {
-    int total = 0;
-    int asymmetric = 0;
-    diku_check_exit_symmetry(area, &total, &asymmetric);
-    
+    int total = 0, asymmetric = 0;
+    for (area_t *a = areas; a; a = a->next) {
+        int t = 0, asym = 0;
+        diku_check_exit_symmetry(a, &t, &asym);
+        total += t;
+        asymmetric += asym;
+    }
+
     if (asymmetric == 0) {
         printf("\n--- Exit Symmetry ---\n");
         printf("All exits are symmetric (%d exits checked).\n", total);
@@ -196,38 +241,40 @@ static bool page_symmetry(area_t *area)
         if (action == PAGE_QUIT) return true;
         return false;
     }
-    
+
     printf("\n--- Exit Symmetry (%d of %d asymmetric) ---\n", asymmetric, total);
-    
+
     int current = 0;
-    for (int i = 0; i < area->room_count; i++) {
-        room_t *room = &area->rooms[i];
-        for (int d = 0; d < DIKU_MAX_EXITS; d++) {
-            exit_t *exit = room->exits[d];
-            if (!exit || !exit->to_room) continue;
-            
-            int rev = diku_reverse_dir(d);
-            room_t *target = exit->to_room;
-            exit_t *return_exit = NULL;
-            if (rev >= 0 && rev < DIKU_MAX_EXITS) {
-                return_exit = target->exits[rev];
-            }
-            
-            if (!return_exit || return_exit->to_room != room) {
-                current++;
-                printf("\n");
-                printf("  #%d -> %s -> #%d missing return %s",
-                       room->vnum, diku_dir_name(d), target->vnum, diku_dir_name(rev));
-                if (return_exit && return_exit->to_room) {
-                    printf(" (goes to #%d instead)\n", return_exit->to_room->vnum);
-                } else if (return_exit) {
-                    printf(" (unresolved)\n");
-                } else {
-                    printf("\n");
+    for (area_t *a = areas; a; a = a->next) {
+        for (int i = 0; i < a->room_count; i++) {
+            room_t *room = &a->rooms[i];
+            for (int d = 0; d < DIKU_MAX_EXITS; d++) {
+                exit_t *exit = room->exits[d];
+                if (!exit || !exit->to_room) continue;
+
+                int rev = diku_reverse_dir(d);
+                room_t *target = exit->to_room;
+                exit_t *return_exit = NULL;
+                if (rev >= 0 && rev < DIKU_MAX_EXITS) {
+                    return_exit = target->exits[rev];
                 }
-                page_action_t action = pager_prompt("Symmetry", current, asymmetric);
-                if (action == PAGE_QUIT) return true;
-                if (action == PAGE_SKIP_CATEGORY) return false;
+
+                if (!return_exit || return_exit->to_room != room) {
+                    current++;
+                    printf("\n");
+                    printf("  #%d -> %s -> #%d missing return %s",
+                           room->vnum, diku_dir_name(d), target->vnum, diku_dir_name(rev));
+                    if (return_exit && return_exit->to_room) {
+                        printf(" (goes to #%d instead)\n", return_exit->to_room->vnum);
+                    } else if (return_exit) {
+                        printf(" (unresolved)\n");
+                    } else {
+                        printf("\n");
+                    }
+                    page_action_t action = pager_prompt("Symmetry", current, asymmetric);
+                    if (action == PAGE_QUIT) return true;
+                    if (action == PAGE_SKIP_CATEGORY) return false;
+                }
             }
         }
     }
@@ -249,6 +296,7 @@ int main(int argc, char *argv[])
     bool show_graph = false;
     bool show_coords = false;
     bool show_symmetry = false;
+    bool load_packages = false;
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] == '-') {
@@ -268,6 +316,8 @@ int main(int argc, char *argv[])
                 show_coords = true;
             } else if (strcmp(argv[i], "--symmetry") == 0) {
                 show_symmetry = true;
+            } else if (strcmp(argv[i], "--packages") == 0) {
+                load_packages = true;
             } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
                 print_usage(argv[0]);
                 return 0;
@@ -278,45 +328,65 @@ int main(int argc, char *argv[])
     }
 
     if (!filename) {
-        printf("Error: No area file specified\n");
+        printf("Error: No input path specified\n");
         print_usage(argv[0]);
         return 1;
     }
 
-    area_t *area = diku_parse_file(filename);
-    if (!area) {
+    area_t *areas = NULL;
+
+    if (is_directory(filename)) {
+        diku_set_progress_callback(progress_cb, NULL);
+        if (load_packages) {
+            areas = diku_load_folder_packages(filename);
+        } else {
+            areas = diku_load_folder_are(filename);
+        }
+        diku_set_progress_callback(NULL, NULL);
+    } else {
+        areas = diku_parse_file(filename);
+    }
+
+    if (!areas) {
         printf("Error: Failed to parse %s (errno=%d: %s)\n",
                filename, errno, strerror(errno));
         return 1;
     }
 
-    diku_resolve_graph_global(area);
-    room_t *central = diku_find_central_room(area);
-    if (central) {
-        diku_assign_coordinates(area, central);
+    diku_resolve_graph_global(areas);
+
+    int area_count = 0;
+    for (area_t *a = areas; a; a = a->next) area_count++;
+
+    if (area_count > 1) {
+        diku_assign_coordinates_multi(areas);
+    } else {
+        room_t *central = diku_find_central_room(areas);
+        if (central) {
+            diku_assign_coordinates(areas, central);
+        }
     }
 
     if (verbose) {
-        /* If no specific entity type selected, default to --all */
         if (!show_rooms && !show_mobiles && !show_objects && !show_graph && !show_coords && !show_symmetry) {
             show_rooms = show_mobiles = show_objects = show_graph = show_coords = show_symmetry = true;
         }
 
         bool quit = false;
-        if (!quit && show_rooms)  quit = page_rooms(area);
-        if (!quit && show_mobiles) quit = page_mobiles(area);
-        if (!quit && show_objects) quit = page_objects(area);
-        if (!quit && show_graph)  quit = page_graph(area);
-        if (!quit && show_coords) quit = page_coords(area);
-        if (!quit && show_symmetry) quit = page_symmetry(area);
+        if (!quit && show_rooms)  quit = page_rooms(areas);
+        if (!quit && show_mobiles) quit = page_mobiles(areas);
+        if (!quit && show_objects) quit = page_objects(areas);
+        if (!quit && show_graph)  quit = page_graph(areas);
+        if (!quit && show_coords) quit = page_coords(areas);
+        if (!quit && show_symmetry) quit = page_symmetry(areas);
     } else {
-        print_overview(area);
+        print_overview(areas, filename);
         if (show_symmetry) {
             printf("\n");
-            diku_print_exit_symmetry(area);
+            diku_print_exit_symmetry(areas);
         }
     }
 
-    diku_free_area(area);
+    diku_free_all_areas(areas);
     return 0;
 }

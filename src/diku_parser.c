@@ -1,10 +1,30 @@
 #include "diku_parser.h"
 #include <limits.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <strings.h>
 
 /* ------------------------------------------------------------------ */
 /* Global state                                                       */
 /* ------------------------------------------------------------------ */
 diku_global_state_t diku_global = {0, 0, 0, 0, 0, 0, 0};
+
+/* ------------------------------------------------------------------ */
+/* Progress callbacks                                                 */
+/* ------------------------------------------------------------------ */
+static diku_progress_cb_t g_progress_cb = NULL;
+static void *g_progress_user = NULL;
+
+void diku_set_progress_callback(diku_progress_cb_t cb, void *user) {
+    g_progress_cb = cb;
+    g_progress_user = user;
+}
+
+static void report_progress(const char *op, int cur, int total, const char *detail) {
+    if (g_progress_cb) {
+        g_progress_cb(op, cur, total, detail ? detail : "", g_progress_user);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Arena allocator implementation                                     */
@@ -489,10 +509,58 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
     /* Description */
     room->desc = diku_fread_string(fp, arena);
     
-    /* Flags and sector */
+    /* Flags and sector - handle 2-field and 3-field formats */
     skip_whitespace(fp);
-    diku_fread_number(fp, &room->flags);
-    diku_fread_number(fp, &room->sector);
+    long flags_pos = ftell(fp);
+    int peek = fgetc(fp);
+    if (peek != EOF) {
+        if (peek == 'D' || peek == 'E' || peek == 'S' || peek == '~' || peek == '#' || peek == '*') {
+            /* Missing flags/sector line - put it back */
+            ungetc(peek, fp);
+        } else {
+            fseek(fp, flags_pos, SEEK_SET);
+            char token1[64], token2[64];
+            if (fscanf(fp, "%63s", token1) == 1) {
+                long after_t1 = ftell(fp);
+                /* Peek next non-space char */
+                int c2;
+                while ((c2 = fgetc(fp)) != EOF && isspace(c2)) {}
+                if (c2 != EOF) {
+                    ungetc(c2, fp);
+                    if (isalpha((unsigned char)c2)) {
+                        /* 3-field format: <num> <bitstring_flags> <sector> */
+                        if (fscanf(fp, "%63s", token2) == 1) {
+                            uint32_t flags = 0;
+                            for (int i = 0; token2[i]; i++) {
+                                if (token2[i] >= 'A' && token2[i] <= 'Z')
+                                    flags |= (1U << (token2[i] - 'A'));
+                                else if (token2[i] >= 'a' && token2[i] <= 'z')
+                                    flags |= (1U << (26 + token2[i] - 'a'));
+                            }
+                            room->flags = flags;
+                            diku_fread_number(fp, &room->sector);
+                        }
+                    } else {
+                        /* 2-field format: <flags> <sector> */
+                        fseek(fp, after_t1, SEEK_SET);
+                        if (isdigit(token1[0]) || token1[0] == '-') {
+                            room->flags = (uint32_t)strtol(token1, NULL, 0);
+                        } else {
+                            uint32_t flags = 0;
+                            for (int i = 0; token1[i]; i++) {
+                                if (token1[i] >= 'A' && token1[i] <= 'Z')
+                                    flags |= (1U << (token1[i] - 'A'));
+                                else if (token1[i] >= 'a' && token1[i] <= 'z')
+                                    flags |= (1U << (26 + token1[i] - 'a'));
+                            }
+                            room->flags = flags;
+                        }
+                        diku_fread_number(fp, &room->sector);
+                    }
+                }
+            }
+        }
+    }
     
     /* Parse room body until S */
     int c;
@@ -504,8 +572,12 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
         
         if (isspace(c)) continue;
         
-        if (c == 'S' || c == 's') {  /* End of room */
-            break;
+        if (c == 'S' || c == 's') {  /* End of room - must be standalone */
+            int next = fgetc(fp);
+            if (next == '\n' || next == '\r' || next == EOF) {
+                break;
+            }
+            if (next != EOF) ungetc(next, fp);
         }
         
         if (c == 'D' || c == 'd') {  /* Exit */
@@ -936,6 +1008,407 @@ item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Classic multi-file section parsers (CircleMUD / original DikuMUD)  */
+/* ------------------------------------------------------------------ */
+
+bool diku_parse_wld_fp(FILE *fp, area_t *area) {
+    if (!fp || !area) return false;
+    
+    int room_capacity = 16;
+    if (area->room_count > 0) {
+        room_capacity = area->room_count * 2;
+        room_t *new_rooms = (room_t *)arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
+        if (new_rooms && area->rooms) {
+            memcpy(new_rooms, area->rooms, area->room_count * sizeof(room_t));
+            area->rooms = new_rooms;
+        }
+    } else {
+        area->rooms = (room_t *)arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
+    }
+    
+    int parsed = 0;
+    while (1) {
+        skip_whitespace(fp);
+        int c = fgetc(fp);
+        if (c == EOF) break;
+        if (c == '$') break;
+        if (c == '#') {
+            int next = fgetc(fp);
+            if (next == '$' || next == '0') {
+                break;
+            }
+            if (isdigit(next)) {
+                ungetc(next, fp);
+                int vnum;
+                room_t *room = diku_parse_room(fp, area->arena, &vnum);
+                if (!room) break;
+                
+                if (area->room_count >= room_capacity) {
+                    room_capacity *= 2;
+                    room_t *new_rooms = (room_t *)arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
+                    if (new_rooms && area->rooms) {
+                        memcpy(new_rooms, area->rooms, area->room_count * sizeof(room_t));
+                        area->rooms = new_rooms;
+                    }
+                }
+                
+                if (area->rooms) {
+                    memcpy(&area->rooms[area->room_count++], room, sizeof(room_t));
+                }
+                parsed++;
+                continue;
+            }
+            if (next != EOF) ungetc(next, fp);
+        }
+        if (c != EOF) ungetc(c, fp);
+        diku_fread_to_endline(fp);
+    }
+    
+    return parsed > 0;
+}
+
+bool diku_parse_mob_fp(FILE *fp, area_t *area) {
+    if (!fp || !area) return false;
+    
+    int mob_capacity = 16;
+    if (area->mobile_count > 0) {
+        mob_capacity = area->mobile_count * 2;
+        mobile_t *new_mobs = (mobile_t *)arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
+        if (new_mobs && area->mobiles) {
+            memcpy(new_mobs, area->mobiles, area->mobile_count * sizeof(mobile_t));
+            area->mobiles = new_mobs;
+        }
+    } else {
+        area->mobiles = (mobile_t *)arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
+    }
+    
+    int parsed = 0;
+    while (1) {
+        skip_whitespace(fp);
+        int c = fgetc(fp);
+        if (c == EOF) break;
+        if (c == '$') break;
+        if (c == '#') {
+            int next = fgetc(fp);
+            if (next == '$' || next == '0') {
+                break;
+            }
+            if (isdigit(next)) {
+                ungetc(next, fp);
+                int vnum;
+                mobile_t *mob = diku_parse_mobile(fp, area->arena, &vnum);
+                if (!mob) break;
+                
+                if (area->mobile_count >= mob_capacity) {
+                    mob_capacity *= 2;
+                    mobile_t *new_mobs = (mobile_t *)arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
+                    if (new_mobs && area->mobiles) {
+                        memcpy(new_mobs, area->mobiles, area->mobile_count * sizeof(mobile_t));
+                        area->mobiles = new_mobs;
+                    }
+                }
+                
+                if (area->mobiles) {
+                    memcpy(&area->mobiles[area->mobile_count++], mob, sizeof(mobile_t));
+                }
+                parsed++;
+                continue;
+            }
+            if (next != EOF) ungetc(next, fp);
+        }
+        if (c != EOF) ungetc(c, fp);
+        diku_fread_to_endline(fp);
+    }
+    
+    return parsed > 0;
+}
+
+bool diku_parse_obj_fp(FILE *fp, area_t *area) {
+    if (!fp || !area) return false;
+    
+    int item_capacity = 16;
+    if (area->item_count > 0) {
+        item_capacity = area->item_count * 2;
+        item_t *new_items = (item_t *)arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
+        if (new_items && area->items) {
+            memcpy(new_items, area->items, area->item_count * sizeof(item_t));
+            area->items = new_items;
+        }
+    } else {
+        area->items = (item_t *)arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
+    }
+    
+    int parsed = 0;
+    while (1) {
+        skip_whitespace(fp);
+        int c = fgetc(fp);
+        if (c == EOF) break;
+        if (c == '$') break;
+        if (c == '#') {
+            int next = fgetc(fp);
+            if (next == '$' || next == '0') {
+                break;
+            }
+            if (isdigit(next)) {
+                ungetc(next, fp);
+                int vnum;
+                item_t *item = diku_parse_item(fp, area->arena, &vnum);
+                if (!item) break;
+                
+                if (area->item_count >= item_capacity) {
+                    item_capacity *= 2;
+                    item_t *new_items = (item_t *)arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
+                    if (new_items && area->items) {
+                        memcpy(new_items, area->items, area->item_count * sizeof(item_t));
+                        area->items = new_items;
+                    }
+                }
+                
+                if (area->items) {
+                    memcpy(&area->items[area->item_count++], item, sizeof(item_t));
+                }
+                parsed++;
+                continue;
+            }
+            if (next != EOF) ungetc(next, fp);
+        }
+        if (c != EOF) ungetc(c, fp);
+        diku_fread_to_endline(fp);
+    }
+    
+    return parsed > 0;
+}
+
+bool diku_parse_zon_fp(FILE *fp, area_t *area) {
+    if (!fp || !area) return false;
+    
+    skip_whitespace(fp);
+    
+    /* Optional zone number header: #<num> */
+    int c = fgetc(fp);
+    if (c == '#') {
+        int zone_num;
+        diku_fread_number(fp, &zone_num);
+        skip_whitespace(fp);
+        c = fgetc(fp);
+    }
+    if (c != EOF) ungetc(c, fp);
+    
+    /* Zone name */
+    diku_string_t name = diku_fread_string(fp, area->arena);
+    if (name.len > 0 && (!area->name.str || area->name.len == 0)) {
+        area->name = name;
+    }
+    
+    /* Header numbers: top_vnum lifespan reset_mode ... */
+    diku_fread_to_endline(fp);
+    
+    /* Read reset commands until S or $ */
+    char **lines = NULL;
+    int count = 0;
+    char buf[4096];
+    
+    while (fgets(buf, sizeof(buf), fp)) {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) {
+            buf[--len] = '\0';
+        }
+        
+        if (len == 0) continue;
+        if (buf[0] == '*') continue;
+        if (buf[0] == 'S' || buf[0] == 's' || buf[0] == '$') {
+            break;
+        }
+        
+        count++;
+        char **new_lines = (char **)arena_alloc(area->arena, count * sizeof(char *));
+        if (new_lines && lines) {
+            memcpy(new_lines, lines, (count - 1) * sizeof(char *));
+        }
+        lines = new_lines;
+        if (lines) {
+            lines[count - 1] = arena_strdup(area->arena, buf);
+        }
+    }
+    
+    area->resets_raw = lines;
+    area->resets_line_count = count;
+    diku_parse_resets(area);
+    
+    return true;
+}
+
+area_t *diku_parse_package_files(const char *wld, const char *mob, const char *obj, const char *zon) {
+    arena_t *arena = arena_create();
+    if (!arena) return NULL;
+    
+    area_t *area = (area_t *)arena_alloc_aligned(arena, sizeof(area_t), 64);
+    if (!area) {
+        arena_free_all(arena);
+        return NULL;
+    }
+    memset(area, 0, sizeof(area_t));
+    area->arena = arena;
+    
+    bool has_data = false;
+    FILE *fp;
+    
+    fp = fopen(wld, "r");
+    if (fp) {
+        area->filename = arena_strndup(arena, wld, strlen(wld));
+        if (diku_parse_wld_fp(fp, area)) has_data = true;
+        fclose(fp);
+    }
+    
+    fp = fopen(mob, "r");
+    if (fp) {
+        if (diku_parse_mob_fp(fp, area)) has_data = true;
+        fclose(fp);
+    }
+    
+    fp = fopen(obj, "r");
+    if (fp) {
+        if (diku_parse_obj_fp(fp, area)) has_data = true;
+        fclose(fp);
+    }
+    
+    fp = fopen(zon, "r");
+    if (fp) {
+        if (diku_parse_zon_fp(fp, area)) has_data = true;
+        fclose(fp);
+    }
+    
+    if (!has_data) {
+        diku_free_area(area);
+        return NULL;
+    }
+    
+    /* Build vnum hash table */
+    if (area->room_count > 0) {
+        area->rooms_by_vnum = (room_t **)calloc(DIKU_VNUM_HASH_SIZE, sizeof(room_t *));
+        for (int i = 0; i < area->room_count; i++) {
+            int hash = area->rooms[i].vnum & DIKU_VNUM_HASH_MASK;
+            if (!area->rooms_by_vnum[hash]) {
+                area->rooms_by_vnum[hash] = &area->rooms[i];
+            }
+        }
+    }
+    
+    return area;
+}
+
+area_t *diku_parse_package(const char *base_path) {
+    size_t len = strlen(base_path);
+    char *wld = (char *)malloc(len + 5);
+    char *mob = (char *)malloc(len + 5);
+    char *obj = (char *)malloc(len + 5);
+    char *zon = (char *)malloc(len + 5);
+    
+    if (!wld || !mob || !obj || !zon) {
+        free(wld); free(mob); free(obj); free(zon);
+        return NULL;
+    }
+    
+    sprintf(wld, "%s.wld", base_path);
+    sprintf(mob, "%s.mob", base_path);
+    sprintf(obj, "%s.obj", base_path);
+    sprintf(zon, "%s.zon", base_path);
+    
+    area_t *area = diku_parse_package_files(wld, mob, obj, zon);
+    
+    free(wld); free(mob); free(obj); free(zon);
+    return area;
+}
+
+area_t *diku_load_folder_are(const char *folder_path) {
+    DIR *dir = opendir(folder_path);
+    if (!dir) return NULL;
+    
+    struct dirent *entry;
+    int total = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        if (len > 4 && strcasecmp(entry->d_name + len - 4, ".are") == 0) {
+            total++;
+        }
+    }
+    rewinddir(dir);
+    
+    area_t *head = NULL;
+    area_t *tail = NULL;
+    int current = 0;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        if (len <= 4 || strcasecmp(entry->d_name + len - 4, ".are") != 0) continue;
+        
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", folder_path, entry->d_name);
+        
+        report_progress("parse_are", current, total, path);
+        
+        area_t *area = diku_parse_file(path);
+        if (area) {
+            if (!head) {
+                head = tail = area;
+            } else {
+                tail->next = area;
+                tail = area;
+            }
+        }
+        current++;
+    }
+    
+    closedir(dir);
+    report_progress("parse_are", total, total, "done");
+    return head;
+}
+
+area_t *diku_load_folder_packages(const char *folder_path) {
+    DIR *dir = opendir(folder_path);
+    if (!dir) return NULL;
+    
+    struct dirent *entry;
+    int total = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        if (len > 4 && strcasecmp(entry->d_name + len - 4, ".wld") == 0) {
+            total++;
+        }
+    }
+    rewinddir(dir);
+    
+    area_t *head = NULL;
+    area_t *tail = NULL;
+    int current = 0;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        if (len <= 4 || strcasecmp(entry->d_name + len - 4, ".wld") != 0) continue;
+        
+        char base[4096];
+        snprintf(base, sizeof(base), "%s/%.*s", folder_path, (int)(len - 4), entry->d_name);
+        
+        report_progress("parse_package", current, total, base);
+        
+        area_t *area = diku_parse_package(base);
+        if (area) {
+            if (!head) {
+                head = tail = area;
+            } else {
+                tail->next = area;
+                tail = area;
+            }
+        }
+        current++;
+    }
+    
+    closedir(dir);
+    report_progress("parse_package", total, total, "done");
+    return head;
+}
+
+/* ------------------------------------------------------------------ */
 /* Store raw section (for resets, shops, etc)                         */
 /* ------------------------------------------------------------------ */
 
@@ -999,10 +1472,8 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
         }
         
         const char *section = buf + 1;
-        fprintf(stderr, "DWARFDBG: main loop section='%s' pos=%ld\n", section, ftell(fp));
         
         if (strcmp(section, "ROOMS") == 0) {
-            fprintf(stderr, "DWARFDBG: entering ROOMS section at pos=%ld\n", ftell(fp));
             /* Parse rooms */
             int room_capacity = 16;
             area->rooms = (room_t *)arena_alloc_aligned(arena, sizeof(room_t) * room_capacity, 64);
@@ -1018,13 +1489,10 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                 
                 /* Check for end of rooms */
                 int c = fgetc(fp);
-                fprintf(stderr, "DWARFDBG: room loop c='%c' (0x%02x) pos=%ld\n", c >= 32 && c < 127 ? c : '.', (unsigned char)c, pos);
                 if (c == '#') {
                     char next[16];
                     if (fscanf(fp, "%15s", next) == 1) {
-                        fprintf(stderr, "DWARFDBG: room loop next='%s'\n", next);
                         if (strcmp(next, "0") == 0) {
-                            fprintf(stderr, "DWARFDBG: end of rooms #0\n");
                             break;  /* End of rooms */
                         } else {
                             /* It's a room vnum - skip the # and position after it */
@@ -1032,21 +1500,22 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                         }
                     }
                 } else if (c == '0') {
-                    fprintf(stderr, "DWARFDBG: end of rooms 0\n");
                     break;  /* End of rooms */
                 } else if (c == EOF) {
-                    fprintf(stderr, "DWARFDBG: end of rooms EOF\n");
                     break;
                 } else {
-                    fprintf(stderr, "DWARFDBG: seek back and continue\n");
                     fseek(fp, pos, SEEK_SET);
+                    diku_fread_to_endline(fp);
                     continue;
                 }
                 
                 /* Parse room */
                 room_t *room = diku_parse_room(fp, arena, &vnum);
-                fprintf(stderr, "DWARFDBG: parsed room vnum=%d room=%p\n", vnum, (void*)room);
-                if (!room) break;
+                if (!room) {
+                    fprintf(stderr, "diku_parse_room NULL at pos %ld\n", ftell(fp));
+                    break;
+                }
+                fprintf(stderr, "ROOM #%d %s\n", vnum, room->name.str ? room->name.str : "");
                 
                 /* Grow array if needed */
                 if (area->room_count >= room_capacity) {
@@ -1085,6 +1554,7 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                     break;
                 } else {
                     fseek(fp, pos, SEEK_SET);
+                    diku_fread_to_endline(fp);
                     continue;
                 }
                 
@@ -1118,20 +1588,18 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                     char next[16];
                     if (fscanf(fp, "%15s", next) == 1) {
                         if (strcmp(next, "0") == 0) {
-                            fprintf(stderr, "DWARFDBG: objects end on #0 at pos=%ld\n", pos);
                             break;
                         } else {
                             fseek(fp, pos + 1, SEEK_SET);
                         }
                     }
                 } else if (c == '0') {
-                    fprintf(stderr, "DWARFDBG: objects end on 0 at pos=%ld\n", pos);
                     break;
                 } else if (c == EOF) {
-                    fprintf(stderr, "DWARFDBG: objects end on EOF at pos=%ld\n", pos);
                     break;
                 } else {
                     fseek(fp, pos, SEEK_SET);
+                    diku_fread_to_endline(fp);
                     continue;
                 }
                 
@@ -1325,11 +1793,14 @@ void diku_parse_resets(area_t *area) {
 
 area_t *diku_parse_file(const char *filename) {
     FILE *fp = fopen(filename, "r");
-    if (!fp) return NULL;
+    if (fp) {
+        area_t *area = diku_parse_fp(fp, filename);
+        fclose(fp);
+        return area;
+    }
     
-    area_t *area = diku_parse_fp(fp, filename);
-    fclose(fp);
-    return area;
+    /* If not a regular file, try as a multi-file package base path */
+    return diku_parse_package(filename);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1373,8 +1844,21 @@ void diku_resolve_graph(area_t **areas, int area_count) {
 }
 
 void diku_resolve_graph_global(area_t *areas) {
-    area_t *area_array[1] = {areas};
-    diku_resolve_graph(area_array, 1);
+    if (!areas) return;
+    
+    /* Count areas in linked list */
+    int count = 0;
+    for (area_t *a = areas; a; a = a->next) count++;
+    
+    /* Build array of area pointers */
+    area_t **area_array = (area_t **)malloc(count * sizeof(area_t *));
+    int i = 0;
+    for (area_t *a = areas; a; a = a->next) {
+        area_array[i++] = a;
+    }
+    
+    diku_resolve_graph(area_array, count);
+    free(area_array);
 }
 
 /* ------------------------------------------------------------------ */

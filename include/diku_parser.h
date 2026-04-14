@@ -336,6 +336,12 @@ typedef struct {
 extern diku_global_state_t diku_global;
 
 /* ------------------------------------------------------------------ */
+/* Progress callbacks                                                 */
+/* ------------------------------------------------------------------ */
+typedef void (*diku_progress_cb_t)(const char *operation, int current, int total, const char *detail, void *user);
+void diku_set_progress_callback(diku_progress_cb_t cb, void *user);
+
+/* ------------------------------------------------------------------ */
 /* Arena allocator API                                                */
 /* ------------------------------------------------------------------ */
 arena_t *arena_create(void);
@@ -374,6 +380,20 @@ area_t *diku_parse_file(const char *filename);
 
 /* Parse from an open FILE*. Returns NULL on failure. */
 area_t *diku_parse_fp(FILE *fp, const char *filename);
+
+/* Parse individual classic DikuMUD/CircleMUD files into an area */
+bool diku_parse_wld_fp(FILE *fp, area_t *area);
+bool diku_parse_mob_fp(FILE *fp, area_t *area);
+bool diku_parse_obj_fp(FILE *fp, area_t *area);
+bool diku_parse_zon_fp(FILE *fp, area_t *area);
+
+/* Load a 4-file package by basename (e.g. "areas/1") */
+area_t *diku_parse_package(const char *base_path);
+area_t *diku_parse_package_files(const char *wld, const char *mob, const char *obj, const char *zon);
+
+/* Load all .are files or all multi-file packages from a folder */
+area_t *diku_load_folder_are(const char *folder_path);
+area_t *diku_load_folder_packages(const char *folder_path);
 
 /* Parse resets and populate room contents (call after diku_parse_fp) */
 void diku_parse_resets(area_t *area);
