@@ -11,6 +11,8 @@
 #include <assert.h>
 #include <math.h>
 
+#include <memento.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -19,7 +21,6 @@ extern "C" {
 /* Configuration constants                                            */
 /* ------------------------------------------------------------------ */
 #define DIKU_MAX_EXITS      12
-#define DIKU_ARENA_BLOCK    (1024*1024*4)
 #define DIKU_VNUM_HASH_BITS 12
 #define DIKU_VNUM_HASH_SIZE (1 << DIKU_VNUM_HASH_BITS)
 #define DIKU_VNUM_HASH_MASK (DIKU_VNUM_HASH_SIZE - 1)
@@ -57,7 +58,6 @@ static const int dir_offset[12][3] = {
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                               */
 /* ------------------------------------------------------------------ */
-typedef struct arena_t arena_t;
 typedef struct diku_string_t diku_string_t;
 typedef struct exit_t exit_t;
 typedef struct room_t room_t;
@@ -66,17 +66,11 @@ typedef struct item_t item_t;
 typedef struct area_t area_t;
 typedef struct coord3d_t coord3d_t;
 typedef struct vnum_hash_entry_t vnum_hash_entry_t;
+typedef struct diku_lexer_t diku_lexer_t;
 
 /* ------------------------------------------------------------------ */
-/* Arena & string types                                               */
+/* String & coordinate types                                          */
 /* ------------------------------------------------------------------ */
-struct arena_t {
-    char *buf;
-    size_t used;
-    size_t cap;
-    arena_t *next;
-};
-
 struct diku_string_t {
     char *str;
     size_t len;
@@ -168,7 +162,7 @@ struct area_t {
     int helps_line_count, resets_line_count, shops_line_count, specials_line_count, objfuns_line_count;
     struct { diku_string_t section_name; char **lines; int line_count; } *extra_sections;
     int extra_section_count;
-    arena_t *arena;
+    memento_arena_t *arena;
     area_t *next;
 } __attribute__((aligned(64)));
 
@@ -185,38 +179,84 @@ typedef void (*diku_progress_cb_t)(const char *operation, int current, int total
 void diku_set_progress_callback(diku_progress_cb_t cb, void *user);
 
 /* ------------------------------------------------------------------ */
-/* Arena & low-level parser API                                       */
+/* Lexer types                                                        */
 /* ------------------------------------------------------------------ */
-arena_t *arena_create(void);
-void *arena_alloc(arena_t *a, size_t n);
-void *arena_alloc_aligned(arena_t *a, size_t n, size_t align);
-char *arena_strdup(arena_t *a, const char *s);
-diku_string_t arena_strndup(arena_t *a, const char *s, size_t len);
-diku_string_t arena_strdup_diku(arena_t *a, const char *s);
-void arena_free_all(arena_t *a);
+typedef enum {
+    TOK_EOF,
+    TOK_HASH_SECTION,   /* #ROOMS, #MOBILES, etc. */
+    TOK_NUMBER,
+    TOK_STRING,         /* ~ terminated, trimmed */
+    TOK_WORD,           /* single word for flags, etc. */
+    TOK_EOL,
+    TOK_UNKNOWN
+} diku_token_type_t;
 
-int diku_fread_number(FILE *fp, int *out);
-diku_string_t diku_fread_string(FILE *fp, arena_t *arena);
-diku_string_t diku_fread_string_eol(FILE *fp, arena_t *arena);
-char *diku_fread_word(FILE *fp, arena_t *arena);
-char *diku_fread_line(FILE *fp, arena_t *arena);
-void diku_fread_to_endline(FILE *fp);
-bool diku_fread_letter(FILE *fp, char expected);
+typedef struct {
+    const char *start;      /* pointer into file buffer */
+    size_t      len;
+    diku_token_type_t type;
+    int         line;
+    int         col;
+} diku_token_t;
+
+struct diku_lexer_t {
+    memento_arena_t *arena;
+    const char *buf;        /* entire file, arena-backed or malloc'd */
+    const char *pos;
+    const char *end;
+    int         line;
+    int         col;
+    bool        owns_buf;   /* true if buf was malloc'd */
+};
+
+/* ------------------------------------------------------------------ */
+/* Arena helpers (thin wrappers over memento)                         */
+/* ------------------------------------------------------------------ */
+memento_arena_t *diku_arena_create(void);
+void *diku_arena_alloc(memento_arena_t *a, size_t n);
+void *diku_arena_alloc_aligned(memento_arena_t *a, size_t n, size_t align);
+char *diku_arena_strdup(memento_arena_t *a, const char *s);
+diku_string_t diku_arena_strndup(memento_arena_t *a, const char *s, size_t len);
+diku_string_t diku_arena_strdup_diku(memento_arena_t *a, const char *s);
+void diku_arena_free_all(memento_arena_t *a);
+
+/* ------------------------------------------------------------------ */
+/* Lexer API                                                          */
+/* ------------------------------------------------------------------ */
+bool diku_lexer_init_file(diku_lexer_t *lex, const char *filename);
+bool diku_lexer_init_fp(diku_lexer_t *lex, FILE *fp);
+void diku_lexer_init_buf(diku_lexer_t *lex, const char *buf, size_t len);
+void diku_lexer_cleanup(diku_lexer_t *lex);
+
+diku_token_t diku_lexer_next(diku_lexer_t *lex);
+int diku_lexer_getc(diku_lexer_t *lex);
+void diku_lexer_ungetc(diku_lexer_t *lex, int c);
+long diku_lexer_tell(diku_lexer_t *lex);
+void diku_lexer_seek(diku_lexer_t *lex, long pos);
+int diku_lexer_peek(diku_lexer_t *lex);
+void diku_lexer_skip_ws(diku_lexer_t *lex);
+void diku_lexer_skip_line(diku_lexer_t *lex);
+bool diku_lexer_read_word(diku_lexer_t *lex, char *out, size_t max);
+bool diku_lexer_read_line(diku_lexer_t *lex, char *out, size_t max);
+int diku_lexer_read_number(diku_lexer_t *lex, int *out);
+diku_string_t diku_lexer_read_string(diku_lexer_t *lex, memento_arena_t *arena);
+char *diku_lexer_read_word_dup(diku_lexer_t *lex, memento_arena_t *arena);
+bool diku_lexer_eof(diku_lexer_t *lex);
 
 /* ------------------------------------------------------------------ */
 /* Section parsers & main entry points                                */
 /* ------------------------------------------------------------------ */
-area_t *diku_parse_area_header(FILE *fp, arena_t *arena);
-room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out);
-mobile_t *diku_parse_mobile(FILE *fp, arena_t *arena, int *vnum_out);
-item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out);
+area_t *diku_parse_area_header(diku_lexer_t *lex, memento_arena_t *arena);
+room_t *diku_parse_room(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out);
+mobile_t *diku_parse_mobile(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out);
+item_t *diku_parse_item(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out);
 
 area_t *diku_parse_file(const char *filename);
-area_t *diku_parse_fp(FILE *fp, const char *filename);
-bool diku_parse_wld_fp(FILE *fp, area_t *area);
-bool diku_parse_mob_fp(FILE *fp, area_t *area);
-bool diku_parse_obj_fp(FILE *fp, area_t *area);
-bool diku_parse_zon_fp(FILE *fp, area_t *area);
+area_t *diku_parse_lexer(diku_lexer_t *lex, const char *filename);
+bool diku_parse_wld(diku_lexer_t *lex, area_t *area);
+bool diku_parse_mob(diku_lexer_t *lex, area_t *area);
+bool diku_parse_obj(diku_lexer_t *lex, area_t *area);
+bool diku_parse_zon(diku_lexer_t *lex, area_t *area);
 area_t *diku_parse_package(const char *base_path);
 area_t *diku_parse_package_files(const char *wld, const char *mob, const char *obj, const char *zon);
 area_t *diku_load_folder_are(const char *folder_path);
@@ -224,7 +264,7 @@ area_t *diku_load_folder_packages(const char *folder_path);
 void diku_parse_resets(area_t *area);
 
 /* ------------------------------------------------------------------ */
-/* Graph resolution & lookups (explicitly declared for your .c)       */
+/* Graph resolution & lookups                                         */
 /* ------------------------------------------------------------------ */
 void diku_resolve_graph(area_t **areas, int area_count);
 void diku_resolve_graph_global(area_t *areas);
@@ -288,4 +328,3 @@ const char *diku_item_type_name(int type);
 }
 #endif
 #endif
-

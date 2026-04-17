@@ -1,3 +1,4 @@
+#define MEMENTO_IMPLEMENTATION
 #include "diku_parser.h"
 #include <limits.h>
 #include <dirent.h>
@@ -27,302 +28,387 @@ static void report_progress(const char *op, int cur, int total, const char *deta
 }
 
 /* ------------------------------------------------------------------ */
-/* Arena allocator implementation                                     */
+/* Lexer and arena wrappers                                           */
 /* ------------------------------------------------------------------ */
 
-arena_t *arena_create(void) {
-    arena_t *a = (arena_t *)malloc(sizeof(arena_t));
-    if (!a) return NULL;
-    
-    a->buf = (char *)malloc(DIKU_ARENA_BLOCK);
-    if (!a->buf) {
-        free(a);
-        return NULL;
+memento_arena_t *diku_arena_create(void) {
+    static bool memento_initialized = false;
+    if (!memento_initialized) {
+        memento_init();
+        memento_initialized = true;
     }
-    
-    a->used = 0;
-    a->cap = DIKU_ARENA_BLOCK;
-    a->next = NULL;
-    return a;
+    memento_thread_heap_t *heap = memento_thread_heap_get();
+    return memento_arena_create(4 * 1024 * 1024, heap);
 }
 
-static void *arena_alloc_from(arena_t *a, size_t n, size_t align) {
-    /* Calculate aligned offset */
-    uintptr_t base = (uintptr_t)(a->buf + a->used);
-    uintptr_t aligned = (base + align - 1) & ~(align - 1);
-    size_t padding = aligned - base;
-    
-    if (a->used + padding + n > a->cap) {
-        return NULL; /* Not enough space */
-    }
-    
-    a->used += padding + n;
-    return (void *)aligned;
+void *diku_arena_alloc(memento_arena_t *a, size_t n) {
+    if (!a || n == 0) return NULL;
+    return memento_arena_alloc(a, n, 8);
 }
 
-void *arena_alloc(arena_t *a, size_t n) {
-    /* Try current arena */
-    void *p = arena_alloc_from(a, n, 8);
-    if (p) return p;
-    
-    /* Need new arena block */
-    arena_t *new_arena = arena_create();
-    if (!new_arena) return NULL;
-    
-    /* Link and allocate from new */
-    new_arena->next = a->next;
-    a->next = new_arena;
-    
-    return arena_alloc_from(new_arena, n, 8);
+void *diku_arena_alloc_aligned(memento_arena_t *a, size_t n, size_t align) {
+    if (!a || n == 0) return NULL;
+    return memento_arena_alloc(a, n, align);
 }
 
-void *arena_alloc_aligned(arena_t *a, size_t n, size_t align) {
-    void *p = arena_alloc_from(a, n, align);
-    if (p) return p;
-    
-    arena_t *new_arena = arena_create();
-    if (!new_arena) return NULL;
-    
-    new_arena->next = a->next;
-    a->next = new_arena;
-    
-    return arena_alloc_from(new_arena, n, align);
-}
-
-char *arena_strdup(arena_t *a, const char *s) {
+char *diku_arena_strdup(memento_arena_t *a, const char *s) {
     if (!s) return NULL;
     size_t len = strlen(s);
-    char *copy = (char *)arena_alloc(a, len + 1);
+    char *copy = (char *)diku_arena_alloc(a, len + 1);
     if (!copy) return NULL;
     memcpy(copy, s, len + 1);
     return copy;
 }
 
-diku_string_t arena_strndup(arena_t *a, const char *s, size_t len) {
+diku_string_t diku_arena_strndup(memento_arena_t *a, const char *s, size_t len) {
     diku_string_t result = {NULL, 0};
     if (!s) return result;
-    
-    result.str = (char *)arena_alloc(a, len + 1);
+    result.str = (char *)diku_arena_alloc(a, len + 1);
     if (!result.str) return result;
-    
     memcpy(result.str, s, len);
     result.str[len] = '\0';
     result.len = len;
     return result;
 }
 
-diku_string_t arena_strdup_diku(arena_t *a, const char *s) {
+diku_string_t diku_arena_strdup_diku(memento_arena_t *a, const char *s) {
     diku_string_t result = {NULL, 0};
     if (!s) return result;
-    
-    /* Diku strings end with ~ */
     const char *end = strchr(s, '~');
     if (!end) end = s + strlen(s);
-    
     size_t len = end - s;
-    
-    /* Trim trailing whitespace/newlines */
     while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r' || s[len-1] == ' ' || s[len-1] == '\t'))
         len--;
-    
-    result.str = (char *)arena_alloc(a, len + 1);
+    result.str = (char *)diku_arena_alloc(a, len + 1);
     if (!result.str) return result;
-    
     memcpy(result.str, s, len);
     result.str[len] = '\0';
     result.len = len;
     return result;
 }
 
-void arena_free_all(arena_t *a) {
-    if (!a) return;
-    
-    /* Free all subsequent arenas first */
-    if (a->next) {
-        arena_free_all(a->next);
-    }
-    
-    free(a->buf);
-    free(a);
+void diku_arena_free_all(memento_arena_t *a) {
+    if (a) memento_arena_destroy(a);
 }
 
 /* ------------------------------------------------------------------ */
-/* Low-level file reading                                             */
+/* Lexer implementation                                               */
 /* ------------------------------------------------------------------ */
 
-/* Skip whitespace and comments */
-static void skip_whitespace(FILE *fp) {
-    int c;
-    while ((c = fgetc(fp)) != EOF) {
-        if (isspace(c)) continue;
-        if (c == '*') {  /* Comment - skip to end of line */
-            while ((c = fgetc(fp)) != EOF && c != '\n');
+bool diku_lexer_init_file(diku_lexer_t *lex, const char *filename) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) return false;
+    bool ok = diku_lexer_init_fp(lex, fp);
+    fclose(fp);
+    return ok;
+}
+
+bool diku_lexer_init_fp(diku_lexer_t *lex, FILE *fp) {
+    if (!fp || fseek(fp, 0, SEEK_END) != 0) return false;
+    long size = ftell(fp);
+    if (size < 0) return false;
+    rewind(fp);
+    char *buf = (char *)malloc(size + 1);
+    if (!buf) return false;
+    size_t read = fread(buf, 1, size, fp);
+    buf[read] = '\0';
+    diku_lexer_init_buf(lex, buf, read);
+    lex->owns_buf = true;
+    return true;
+}
+
+void diku_lexer_init_buf(diku_lexer_t *lex, const char *buf, size_t len) {
+    memset(lex, 0, sizeof(*lex));
+    lex->buf = buf;
+    lex->pos = buf;
+    lex->end = buf + len;
+    lex->line = 1;
+    lex->col = 1;
+    lex->owns_buf = false;
+}
+
+void diku_lexer_cleanup(diku_lexer_t *lex) {
+    if (lex && lex->owns_buf) {
+        free((void *)lex->buf);
+        lex->buf = NULL;
+        lex->pos = NULL;
+        lex->end = NULL;
+        lex->owns_buf = false;
+    }
+}
+
+diku_token_t diku_lexer_next(diku_lexer_t *lex) {
+    diku_token_t tok = {NULL, 0, TOK_EOF, lex->line, lex->col};
+
+    while (lex->pos < lex->end) {
+        char c = *lex->pos;
+        if (c == '\n') { lex->line++; lex->col = 1; lex->pos++; }
+        else if (c == '\r') { lex->pos++; }
+        else if (c == '*') {
+            while (lex->pos < lex->end && *lex->pos != '\n') lex->pos++;
             continue;
         }
-        ungetc(c, fp);
-        break;
+        else if (isspace((unsigned char)c)) { lex->pos++; lex->col++; }
+        else break;
+    }
+
+    if (lex->pos >= lex->end) return tok;
+
+    const char *start = lex->pos;
+    char c = *lex->pos++;
+    int start_col = lex->col++;
+
+    if (c == '#') {
+        tok.type = TOK_HASH_SECTION;
+        while (lex->pos < lex->end && !isspace((unsigned char)*lex->pos) && *lex->pos != '\n' && *lex->pos != '\r')
+            lex->pos++;
+        tok.start = start;
+        tok.len = (size_t)(lex->pos - start);
+        tok.line = lex->line;
+        tok.col = start_col;
+        return tok;
+    }
+
+    if (isdigit((unsigned char)c) || c == '-' || c == '+') {
+        tok.type = TOK_NUMBER;
+        while (lex->pos < lex->end && isdigit((unsigned char)*lex->pos)) { lex->pos++; lex->col++; }
+        tok.start = start;
+        tok.len = (size_t)(lex->pos - start);
+        tok.line = lex->line;
+        tok.col = start_col;
+        return tok;
+    }
+
+    if (c == '~') {
+        tok.type = TOK_STRING;
+        tok.start = lex->pos;
+        tok.len = 0;
+        tok.line = lex->line;
+        tok.col = start_col;
+        return tok;
+    }
+
+    const char *tilde = memchr(lex->pos - 1, '~', (size_t)(lex->end - (lex->pos - 1)));
+    if (tilde) {
+        tok.type = TOK_STRING;
+        tok.start = start + 1;
+        tok.len = (size_t)(tilde - start - 1);
+        while (tok.len > 0 && (tok.start[tok.len-1] == '\n' || tok.start[tok.len-1] == '\r' ||
+                               tok.start[tok.len-1] == ' ' || tok.start[tok.len-1] == '\t'))
+            tok.len--;
+        lex->pos = tilde + 1;
+        lex->col += (int)(lex->pos - start);
+        tok.line = lex->line;
+        tok.col = start_col;
+        return tok;
+    }
+
+    tok.type = TOK_WORD;
+    while (lex->pos < lex->end && !isspace((unsigned char)*lex->pos) && *lex->pos != '#' && *lex->pos != '~') {
+        lex->pos++;
+        lex->col++;
+    }
+    tok.start = start;
+    tok.len = (size_t)(lex->pos - start);
+    tok.line = lex->line;
+    tok.col = start_col;
+    return tok;
+}
+
+int diku_lexer_getc(diku_lexer_t *lex) {
+    if (lex->pos >= lex->end) return EOF;
+    char c = *lex->pos++;
+    if (c == '\n') { lex->line++; lex->col = 1; }
+    else { lex->col++; }
+    return (unsigned char)c;
+}
+
+void diku_lexer_ungetc(diku_lexer_t *lex, int c) {
+    (void)c;
+    if (lex->pos <= lex->buf) return;
+    lex->pos--;
+    if (*lex->pos == '\n') {
+        lex->line--;
+        lex->col = 1;
+        const char *p = lex->pos - 1;
+        while (p >= lex->buf && *p != '\n') { lex->col++; p--; }
+    } else {
+        lex->col--;
     }
 }
 
-int diku_fread_number(FILE *fp, int *out) {
-    skip_whitespace(fp);
-    
-    int c = fgetc(fp);
-    if (c == EOF) return -1;
-    
-    /* Check for sign */
-    bool negative = false;
-    if (c == '-') {
-        negative = true;
-        c = fgetc(fp);
-        if (c == EOF) return -1;
-    } else if (c == '+') {
-        c = fgetc(fp);
-        if (c == EOF) return -1;
+long diku_lexer_tell(diku_lexer_t *lex) {
+    return (long)(lex->pos - lex->buf);
+}
+
+void diku_lexer_seek(diku_lexer_t *lex, long pos) {
+    if (pos < 0) pos = 0;
+    if (pos > (long)(lex->end - lex->buf)) pos = (long)(lex->end - lex->buf);
+    lex->pos = lex->buf + pos;
+    /* Recalculate line/col from start - slow but correct */
+    lex->line = 1;
+    lex->col = 1;
+    for (const char *p = lex->buf; p < lex->pos; p++) {
+        if (*p == '\n') { lex->line++; lex->col = 1; }
+        else if (*p != '\r') { lex->col++; }
     }
-    
-    /* Must have at least one digit */
-    if (!isdigit(c)) {
-        ungetc(c, fp);
+}
+
+int diku_lexer_peek(diku_lexer_t *lex) {
+    if (lex->pos >= lex->end) return EOF;
+    return (unsigned char)*lex->pos;
+}
+
+void diku_lexer_skip_ws(diku_lexer_t *lex) {
+    while (lex->pos < lex->end) {
+        char c = *lex->pos;
+        if (c == '\n') { lex->line++; lex->col = 1; lex->pos++; }
+        else if (c == '\r') { lex->pos++; }
+        else if (c == '*') {
+            while (lex->pos < lex->end && *lex->pos != '\n') lex->pos++;
+        }
+        else if (isspace((unsigned char)c)) { lex->pos++; lex->col++; }
+        else break;
+    }
+}
+
+void diku_lexer_skip_line(diku_lexer_t *lex) {
+    while (lex->pos < lex->end && *lex->pos != '\n') lex->pos++;
+    if (lex->pos < lex->end && *lex->pos == '\n') { lex->pos++; lex->line++; lex->col = 1; }
+}
+
+bool diku_lexer_read_word(diku_lexer_t *lex, char *out, size_t max) {
+    diku_lexer_skip_ws(lex);
+    if (lex->pos >= lex->end) return false;
+    size_t len = 0;
+    while (lex->pos < lex->end && !isspace((unsigned char)*lex->pos)) {
+        if (len + 1 < max) out[len] = *lex->pos;
+        len++;
+        lex->pos++;
+        lex->col++;
+    }
+    if (len == 0) return false;
+    out[len < max ? len : max - 1] = '\0';
+    return true;
+}
+
+bool diku_lexer_read_line(diku_lexer_t *lex, char *out, size_t max) {
+    if (lex->pos >= lex->end) return false;
+    size_t len = 0;
+    while (lex->pos < lex->end && *lex->pos != '\n' && *lex->pos != '\r') {
+        if (len + 1 < max) out[len] = *lex->pos;
+        len++;
+        lex->pos++;
+        lex->col++;
+    }
+    if (lex->pos < lex->end && (*lex->pos == '\n' || *lex->pos == '\r')) {
+        if (*lex->pos == '\r') lex->pos++;
+        if (lex->pos < lex->end && *lex->pos == '\n') lex->pos++;
+        lex->line++;
+        lex->col = 1;
+    }
+    out[len < max ? len : max - 1] = '\0';
+    return true;
+}
+
+int diku_lexer_read_number(diku_lexer_t *lex, int *out) {
+    diku_lexer_skip_ws(lex);
+    if (lex->pos >= lex->end) return -1;
+
+    const char *start = lex->pos;
+    bool negative = false;
+    if (*lex->pos == '-') { negative = true; lex->pos++; lex->col++; }
+    else if (*lex->pos == '+') { lex->pos++; lex->col++; }
+
+    if (lex->pos >= lex->end || !isdigit((unsigned char)*lex->pos)) {
+        lex->pos = start;
         return -1;
     }
-    
+
     long num = 0;
-    while (isdigit(c)) {
-        num = num * 10 + (c - '0');
-        c = fgetc(fp);
+    while (lex->pos < lex->end && isdigit((unsigned char)*lex->pos)) {
+        num = num * 10 + (*lex->pos - '0');
+        lex->pos++;
+        lex->col++;
     }
-    
-    if (c != EOF) ungetc(c, fp);
-    
+
     *out = negative ? -(int)num : (int)num;
     return 0;
 }
 
-/* Read a string terminated by ~ */
-diku_string_t diku_fread_string(FILE *fp, arena_t *arena) {
-    skip_whitespace(fp);
-    
-    /* Read until ~ */
-    char buf[8192];
-    size_t len = 0;
-    int c;
-    bool at_line_start = true;
-    
-    while ((c = fgetc(fp)) != EOF && c != '~' && len < sizeof(buf) - 1) {
-        /* Safety: stop if we hit a line that looks like a section marker */
-        if (at_line_start && c == '#') {
-            long hash_pos = ftell(fp) - 1;
-            int next = fgetc(fp);
-            if (next == '0') {
-                /* #0 - end of section */
-                fseek(fp, hash_pos, SEEK_SET);
-                break;
-            } else if (isdigit(next)) {
-                /* #<digits> - likely a new vnum/section */
-                int pc = next;
-                bool is_boundary = false;
-                while (isdigit(pc)) {
-                    pc = fgetc(fp);
-                }
-                if (pc == EOF || pc == '\n' || pc == '\r' || pc == ' ') {
-                    is_boundary = true;
-                }
-                if (is_boundary) {
-                    fseek(fp, hash_pos, SEEK_SET);
-                    break;
-                }
-                /* Not a boundary - restore and continue */
-                if (pc != EOF) ungetc(pc, fp);
-                fseek(fp, hash_pos + 1, SEEK_SET);
-            } else if (next != EOF) {
-                ungetc(next, fp);
-            }
-        }
-        buf[len++] = (char)c;
-        at_line_start = (c == '\n');
-    }
-    buf[len] = '\0';
-    
-    /* Trim trailing whitespace */
-    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' || buf[len-1] == ' ' || buf[len-1] == '\t'))
-        len--;
-    buf[len] = '\0';
-    
-    return arena_strndup(arena, buf, len);
-}
-
-/* Read string to end of line */
-diku_string_t diku_fread_string_eol(FILE *fp, arena_t *arena) {
+diku_string_t diku_lexer_read_string(diku_lexer_t *lex, memento_arena_t *arena) {
+    diku_lexer_skip_ws(lex);
     diku_string_t result = {NULL, 0};
-    
-    char buf[4096];
-    if (!fgets(buf, sizeof(buf), fp)) return result;
-    
-    size_t len = strlen(buf);
-    /* Remove newline */
-    if (len > 0 && buf[len-1] == '\n') buf[--len] = '\0';
-    if (len > 0 && buf[len-1] == '\r') buf[--len] = '\0';
-    
-    return arena_strndup(arena, buf, len);
-}
+    if (lex->pos >= lex->end) return result;
 
-/* Read a single word (whitespace delimited) */
-char *diku_fread_word(FILE *fp, arena_t *arena) {
-    skip_whitespace(fp);
-    
-    char buf[256];
-    size_t len = 0;
-    int c;
-    
-    while ((c = fgetc(fp)) != EOF && !isspace(c) && len < sizeof(buf) - 1) {
-        buf[len++] = (char)c;
+    if (*lex->pos == '~') {
+        lex->pos++;
+        lex->col++;
+        return result;
     }
-    
-    if (len == 0) return NULL;
-    
-    buf[len] = '\0';
-    return arena_strdup(arena, buf);
+
+    const char *start = lex->pos;
+    const char *tilde = memchr(lex->pos, '~', (size_t)(lex->end - lex->pos));
+    if (!tilde) tilde = lex->end;
+
+    size_t len = (size_t)(tilde - start);
+    while (len > 0 && (start[len-1] == '\n' || start[len-1] == '\r' || start[len-1] == ' ' || start[len-1] == '\t'))
+        len--;
+
+    result = diku_arena_strndup(arena, start, len);
+    lex->pos = tilde + 1;
+    lex->col += (int)(tilde - start + 1);
+    return result;
 }
 
-/* Read rest of line */
-char *diku_fread_line(FILE *fp, arena_t *arena) {
+char *diku_lexer_read_word_dup(diku_lexer_t *lex, memento_arena_t *arena) {
+    char buf[256];
+    if (!diku_lexer_read_word(lex, buf, sizeof(buf))) return NULL;
+    return diku_arena_strdup(arena, buf);
+}
+
+static char *diku_lexer_read_line_dup(diku_lexer_t *lex, memento_arena_t *arena) {
     char buf[4096];
-    if (!fgets(buf, sizeof(buf), fp)) return NULL;
-    
-    size_t len = strlen(buf);
-    if (len > 0 && buf[len-1] == '\n') buf[--len] = '\0';
-    if (len > 0 && buf[len-1] == '\r') buf[--len] = '\0';
-    
-    return arena_strdup(arena, buf);
+    if (!diku_lexer_read_line(lex, buf, sizeof(buf))) return NULL;
+    return diku_arena_strdup(arena, buf);
 }
 
-/* Skip to end of current line */
-void diku_fread_to_endline(FILE *fp) {
-    int c;
-    while ((c = fgetc(fp)) != EOF && c != '\n');
+bool diku_lexer_eof(diku_lexer_t *lex) {
+    diku_lexer_skip_ws(lex);
+    return lex->pos >= lex->end;
 }
 
-/* Read and expect a specific letter */
-bool diku_fread_letter(FILE *fp, char expected) {
-    skip_whitespace(fp);
-    int c = fgetc(fp);
-    if (c == EOF) return false;
-    return (c == expected);
+static diku_string_t diku_lexer_read_string_eol(diku_lexer_t *lex, memento_arena_t *arena) {
+    diku_string_t result = {NULL, 0};
+    char buf[4096];
+    if (!diku_lexer_read_line(lex, buf, sizeof(buf))) return result;
+    result.str = diku_arena_strdup(arena, buf);
+    result.len = result.str ? strlen(result.str) : 0;
+    return result;
 }
 
-/* ------------------------------------------------------------------ */
+static bool diku_lexer_read_letter(diku_lexer_t *lex, char expected) {
+    diku_lexer_skip_ws(lex);
+    if (lex->pos >= lex->end) return false;
+    if (*lex->pos == expected) {
+        lex->pos++;
+        lex->col++;
+        return true;
+    }
+    return false;
+}
+
 /* Area header parser                                                 */
 /* ------------------------------------------------------------------ */
 
-static bool parse_header_line(area_t *area, FILE *fp, char letter, arena_t *arena) {
+static bool parse_header_line(area_t *area, diku_lexer_t *lex, char letter, memento_arena_t *arena) {
     switch (letter) {
         case 'K':  /* Builders */
-            area->builders = diku_fread_string(fp, arena);
+            area->builders = diku_lexer_read_string(lex, arena);
             return true;
             
         case 'L':  /* Level range - format: {low high}~ */
-            diku_fread_to_endline(fp);  /* Skip for now, parse later if needed */
+            diku_lexer_skip_line(lex);  /* Skip for now, parse later if needed */
             return true;
             
         case 'N':  /* Security */
@@ -330,46 +416,46 @@ static bool parse_header_line(area_t *area, FILE *fp, char letter, arena_t *aren
         case 'V':  /* Vnum range */
         case 'X':  /* Version */
         case 'F':  /* Reset interval */
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
             return true;
             
         case 'U':  /* Ambient sound */
-            area->ambient_sound = diku_fread_string(fp, arena);
+            area->ambient_sound = diku_lexer_read_string(lex, arena);
             return true;
             
         case 'O':  /* Owner */
-            area->owner = diku_fread_string(fp, arena);
+            area->owner = diku_lexer_read_string(lex, arena);
             return true;
             
         case 'R':  /* Reset message */
-            area->reset_msg = diku_fread_string(fp, arena);
+            area->reset_msg = diku_lexer_read_string(lex, arena);
             return true;
             
         case 'W':  /* Weather */
-            area->weather = diku_fread_string(fp, arena);
+            area->weather = diku_lexer_read_string(lex, arena);
             return true;
             
         case 'P':  /* Pay info */
-            area->pay_info = diku_fread_string_eol(fp, arena);
+            area->pay_info = diku_lexer_read_string_eol(lex, arena);
             return true;
             
         case 'T':  /* Teleport info */
-            area->teleport_info = diku_fread_string_eol(fp, arena);
+            area->teleport_info = diku_lexer_read_string_eol(lex, arena);
             return true;
             
         case 'M':  /* Magic info */
-            area->magic_info = diku_fread_string_eol(fp, arena);
+            area->magic_info = diku_lexer_read_string_eol(lex, arena);
             return true;
             
         default:
             /* Unknown header line - skip it */
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
             return true;
     }
 }
 
-area_t *diku_parse_area_header(FILE *fp, arena_t *arena) {
-    area_t *area = (area_t *)arena_alloc_aligned(arena, sizeof(area_t), 64);
+area_t *diku_parse_area_header(diku_lexer_t *lex, memento_arena_t *arena) {
+    area_t *area = (area_t *)diku_arena_alloc_aligned(arena, sizeof(area_t), 64);
     if (!area) return NULL;
     
     memset(area, 0, sizeof(area_t));
@@ -377,7 +463,7 @@ area_t *diku_parse_area_header(FILE *fp, arena_t *arena) {
     
     /* First line should be AREA or #AREA */
     char buf[256];
-    if (!fgets(buf, sizeof(buf), fp)) return NULL;
+    if (!diku_lexer_read_line(lex, buf, sizeof(buf))) return NULL;
     
     /* Check for AREA marker */
     if (strstr(buf, "AREA") || strstr(buf, "#AREA")) {
@@ -392,28 +478,28 @@ area_t *diku_parse_area_header(FILE *fp, arena_t *arena) {
                 size_t len = strlen(name_start);
                 while (len > 0 && (name_start[len-1] == '\n' || name_start[len-1] == '\r'))
                     name_start[--len] = '\0';
-                area->name = arena_strndup(arena, name_start, len);
+                area->name = diku_arena_strndup(arena, name_start, len);
             }
         }
         
         /* If no name found on this line, read from next line */
         if (!area->name.str || area->name.len == 0) {
-            area->name = diku_fread_string(fp, arena);
+            area->name = diku_lexer_read_string(lex, arena);
         }
     }
     
     /* Parse header lines until we hit a section */
     int c;
-    while ((c = fgetc(fp)) != EOF) {
+    while ((c = diku_lexer_getc(lex)) != EOF) {
         if (c == '*') {  /* Comment */
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
             continue;
         }
         
         if (c == '#') {  /* Section start - peek at next chars */
-            long hash_pos = ftell(fp) - 1;  /* Position of # */
+            long hash_pos = diku_lexer_tell(lex) - 1;  /* Position of # */
             char peek[16];
-            if (fscanf(fp, "%15s", peek) == 1) {
+            if (diku_lexer_read_word(lex, peek, 16)) {
                 /* Check if it's a known section */
                 if (strcmp(peek, "ROOMS") == 0 || strcmp(peek, "MOBILES") == 0 ||
                     strcmp(peek, "OBJECTS") == 0 || strcmp(peek, "HELPS") == 0 ||
@@ -421,11 +507,11 @@ area_t *diku_parse_area_header(FILE *fp, arena_t *arena) {
                     strcmp(peek, "SPECIALS") == 0 || strcmp(peek, "OBJFUNS") == 0 ||
                     strcmp(peek, "$") == 0 || isdigit(peek[0])) {
                     /* It's a section marker - seek back and break */
-                    fseek(fp, hash_pos, SEEK_SET);
+                    diku_lexer_seek(lex, hash_pos);
                     break;
                 } else {
                     /* Not a section - treat as header line, skip rest of line */
-                    diku_fread_to_endline(fp);
+                    diku_lexer_skip_line(lex);
                     continue;
                 }
             }
@@ -439,12 +525,12 @@ area_t *diku_parse_area_header(FILE *fp, arena_t *arena) {
         /* character that's not a valid header letter, skip to end of line. */
         if (c < 'A' || c > 'Z') {
             /* Not a valid header letter - skip to end of line */
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
             continue;
         }
         
         /* Header letter */
-        parse_header_line(area, fp, (char)c, arena);
+        parse_header_line(area, lex, (char)c, arena);
     }
     
     return area;
@@ -454,8 +540,8 @@ area_t *diku_parse_area_header(FILE *fp, arena_t *arena) {
 /* Room parser                                                        */
 /* ------------------------------------------------------------------ */
 
-static exit_t *parse_exit(FILE *fp, arena_t *arena, int direction) {
-    exit_t *exit = (exit_t *)arena_alloc(arena, sizeof(exit_t));
+static exit_t *parse_exit(diku_lexer_t *lex, memento_arena_t *arena, int direction) {
+    exit_t *exit = (exit_t *)diku_arena_alloc(arena, sizeof(exit_t));
     if (!exit) return NULL;
     
     memset(exit, 0, sizeof(exit_t));
@@ -471,32 +557,32 @@ static exit_t *parse_exit(FILE *fp, arena_t *arena, int direction) {
      */
     
     /* Description (can be empty) */
-    exit->desc = diku_fread_string(fp, arena);
+    exit->desc = diku_lexer_read_string(lex, arena);
     
     /* Keywords */
-    exit->keywords = diku_fread_string(fp, arena);
+    exit->keywords = diku_lexer_read_string(lex, arena);
     
     /* Lock info line */
-    skip_whitespace(fp);
+    diku_lexer_skip_ws(lex);
     int lock, key, to_vnum;
-    if (diku_fread_number(fp, &lock) == 0) {
+    if (diku_lexer_read_number(lex, &lock) == 0) {
         exit->flags = lock;
-        diku_fread_number(fp, &key);
+        diku_lexer_read_number(lex, &key);
         exit->key_vnum = key;
-        diku_fread_number(fp, &to_vnum);
+        diku_lexer_read_number(lex, &to_vnum);
         exit->to_vnum = to_vnum;
     }
     
     return exit;
 }
 
-room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
+room_t *diku_parse_room(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out) {
     int vnum;
-    if (diku_fread_number(fp, &vnum) != 0) return NULL;
+    if (diku_lexer_read_number(lex, &vnum) != 0) return NULL;
     
     *vnum_out = vnum;
     
-    room_t *room = (room_t *)arena_alloc_aligned(arena, sizeof(room_t), 64);
+    room_t *room = (room_t *)diku_arena_alloc_aligned(arena, sizeof(room_t), 64);
     if (!room) return NULL;
     
     memset(room, 0, sizeof(room_t));
@@ -504,32 +590,32 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
     room->coord_assigned = false;
     
     /* Name */
-    room->name = diku_fread_string(fp, arena);
+    room->name = diku_lexer_read_string(lex, arena);
     
     /* Description */
-    room->desc = diku_fread_string(fp, arena);
+    room->desc = diku_lexer_read_string(lex, arena);
     
     /* Flags and sector - handle 2-field and 3-field formats */
-    skip_whitespace(fp);
-    long flags_pos = ftell(fp);
-    int peek = fgetc(fp);
+    diku_lexer_skip_ws(lex);
+    long flags_pos = diku_lexer_tell(lex);
+    int peek = diku_lexer_getc(lex);
     if (peek != EOF) {
         if (peek == 'D' || peek == 'E' || peek == 'S' || peek == '~' || peek == '#' || peek == '*') {
             /* Missing flags/sector line - put it back */
-            ungetc(peek, fp);
+            diku_lexer_ungetc(lex, peek);
         } else {
-            fseek(fp, flags_pos, SEEK_SET);
+            diku_lexer_seek(lex, flags_pos);
             char token1[64], token2[64];
-            if (fscanf(fp, "%63s", token1) == 1) {
-                long after_t1 = ftell(fp);
+            if (diku_lexer_read_word(lex, token1, 64)) {
+                long after_t1 = diku_lexer_tell(lex);
                 /* Peek next non-space char */
                 int c2;
-                while ((c2 = fgetc(fp)) != EOF && isspace(c2)) {}
+                while ((c2 = diku_lexer_getc(lex)) != EOF && isspace(c2)) {}
                 if (c2 != EOF) {
-                    ungetc(c2, fp);
+                    diku_lexer_ungetc(lex, c2);
                     if (isalpha((unsigned char)c2)) {
                         /* 3-field format: <num> <bitstring_flags> <sector> */
-                        if (fscanf(fp, "%63s", token2) == 1) {
+                        if (diku_lexer_read_word(lex, token2, 64)) {
                             uint32_t flags = 0;
                             for (int i = 0; token2[i]; i++) {
                                 if (token2[i] >= 'A' && token2[i] <= 'Z')
@@ -538,11 +624,11 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
                                     flags |= (1U << (26 + token2[i] - 'a'));
                             }
                             room->flags = flags;
-                            diku_fread_number(fp, &room->sector);
+                            diku_lexer_read_number(lex, &room->sector);
                         }
                     } else {
                         /* 2-field format: <flags> <sector> */
-                        fseek(fp, after_t1, SEEK_SET);
+                        diku_lexer_seek(lex, after_t1);
                         if (isdigit(token1[0]) || token1[0] == '-') {
                             room->flags = (uint32_t)strtol(token1, NULL, 0);
                         } else {
@@ -555,7 +641,7 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
                             }
                             room->flags = flags;
                         }
-                        diku_fread_number(fp, &room->sector);
+                        diku_lexer_read_number(lex, &room->sector);
                     }
                 }
             }
@@ -564,31 +650,31 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
     
     /* Parse room body until S */
     int c;
-    while ((c = fgetc(fp)) != EOF) {
+    while ((c = diku_lexer_getc(lex)) != EOF) {
         if (c == '*') {  /* Comment */
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
             continue;
         }
         
         if (isspace(c)) continue;
         
         if (c == 'S' || c == 's') {  /* End of room - must be standalone */
-            int next = fgetc(fp);
+            int next = diku_lexer_getc(lex);
             if (next == '\n' || next == '\r' || next == EOF) {
                 break;
             }
-            if (next != EOF) ungetc(next, fp);
+            if (next != EOF) diku_lexer_ungetc(lex, next);
         }
         
         if (c == 'D' || c == 'd') {  /* Exit */
             int dir;
-            if (diku_fread_number(fp, &dir) == 0 && dir >= 0 && dir < DIKU_MAX_EXITS) {
-                room->exits[dir] = parse_exit(fp, arena, dir);
+            if (diku_lexer_read_number(lex, &dir) == 0 && dir >= 0 && dir < DIKU_MAX_EXITS) {
+                room->exits[dir] = parse_exit(lex, arena, dir);
             } else {
                 /* Invalid direction - skip this exit */
-                diku_fread_string(fp, arena);  /* desc */
-                diku_fread_string(fp, arena);  /* keywords */
-                diku_fread_to_endline(fp);     /* lock line */
+                diku_lexer_read_string(lex, arena);  /* desc */
+                diku_lexer_read_string(lex, arena);  /* keywords */
+                diku_lexer_skip_line(lex);     /* lock line */
             }
             continue;
         }
@@ -599,10 +685,10 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
             size_t new_size = room->extra_desc_count * sizeof(*room->extra_descs);
             
             if (room->extra_desc_count == 1) {
-                room->extra_descs = arena_alloc(arena, new_size);
+                room->extra_descs = diku_arena_alloc(arena, new_size);
             } else {
                 /* Need to realloc - arena doesn't support this, so we chain */
-                void *new_array = arena_alloc(arena, new_size);
+                void *new_array = diku_arena_alloc(arena, new_size);
                 if (new_array && room->extra_descs) {
                     memcpy(new_array, room->extra_descs, (room->extra_desc_count - 1) * sizeof(*room->extra_descs));
                     room->extra_descs = new_array;
@@ -610,14 +696,14 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
             }
             
             if (room->extra_descs) {
-                room->extra_descs[idx].keywords = diku_fread_string(fp, arena);
-                room->extra_descs[idx].desc = diku_fread_string(fp, arena);
+                room->extra_descs[idx].keywords = diku_lexer_read_string(lex, arena);
+                room->extra_descs[idx].desc = diku_lexer_read_string(lex, arena);
             }
             continue;
         }
         
         /* Unknown - skip to end of line */
-        diku_fread_to_endline(fp);
+        diku_lexer_skip_line(lex);
     }
     
     return room;
@@ -627,29 +713,29 @@ room_t *diku_parse_room(FILE *fp, arena_t *arena, int *vnum_out) {
 /* Mobile parser - handles Merc/ROM format variations                 */
 /* ------------------------------------------------------------------ */
 
-mobile_t *diku_parse_mobile(FILE *fp, arena_t *arena, int *vnum_out) {
+mobile_t *diku_parse_mobile(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out) {
     int vnum;
-    if (diku_fread_number(fp, &vnum) != 0) return NULL;
+    if (diku_lexer_read_number(lex, &vnum) != 0) return NULL;
     
     *vnum_out = vnum;
     
-    mobile_t *mob = (mobile_t *)arena_alloc_aligned(arena, sizeof(mobile_t), 64);
+    mobile_t *mob = (mobile_t *)diku_arena_alloc_aligned(arena, sizeof(mobile_t), 64);
     if (!mob) return NULL;
     
     memset(mob, 0, sizeof(mobile_t));
     mob->vnum = vnum;
     
     /* Name (keywords) */
-    mob->name = diku_fread_string(fp, arena);
+    mob->name = diku_lexer_read_string(lex, arena);
     
     /* Short description */
-    mob->short_desc = diku_fread_string(fp, arena);
+    mob->short_desc = diku_lexer_read_string(lex, arena);
     
     /* Long description */
-    mob->long_desc = diku_fread_string(fp, arena);
+    mob->long_desc = diku_lexer_read_string(lex, arena);
     
     /* Description (can be ~ for none) */
-    diku_string_t desc = diku_fread_string(fp, arena);
+    diku_string_t desc = diku_lexer_read_string(lex, arena);
     if (desc.len > 0 && strcmp(desc.str, "") != 0) {
         mob->description = desc;
     }
@@ -660,11 +746,11 @@ mobile_t *diku_parse_mobile(FILE *fp, arena_t *arena, int *vnum_out) {
      * <level> <hitroll> ...
      */
     
-    skip_whitespace(fp);
+    diku_lexer_skip_ws(lex);
     
     /* Read act flags (can be string like "abc" or number) */
     char buf[256];
-    if (fscanf(fp, "%255s", buf) == 1) {
+    if (diku_lexer_read_word(lex, buf, 255)) {
         /* Check if it's a number or bitstring */
         if (isdigit(buf[0]) || buf[0] == '-') {
             mob->act_flags = (uint32_t)strtol(buf, NULL, 0);
@@ -682,7 +768,7 @@ mobile_t *diku_parse_mobile(FILE *fp, arena_t *arena, int *vnum_out) {
     }
     
     /* Affect flags */
-    if (fscanf(fp, "%255s", buf) == 1) {
+    if (diku_lexer_read_word(lex, buf, 255)) {
         if (isdigit(buf[0]) || buf[0] == '-') {
             mob->aff_flags = (uint32_t)strtol(buf, NULL, 0);
         } else {
@@ -698,125 +784,125 @@ mobile_t *diku_parse_mobile(FILE *fp, arena_t *arena, int *vnum_out) {
     }
     
     /* Alignment */
-    diku_fread_number(fp, (int *)&mob->alignment);
+    diku_lexer_read_number(lex, (int *)&mob->alignment);
     
     /* Letter indicating format type */
     char format_letter = 'S';
-    skip_whitespace(fp);
-    int c = fgetc(fp);
+    diku_lexer_skip_ws(lex);
+    int c = diku_lexer_getc(lex);
     if (c != EOF && isalpha(c)) {
         format_letter = (char)c;
     } else if (c != EOF) {
-        ungetc(c, fp);
+        diku_lexer_ungetc(lex, c);
     }
     
     /* Skip rest of this line */
-    diku_fread_to_endline(fp);
+    diku_lexer_skip_line(lex);
     
     if (format_letter == 'S') {
         /* Simple format - one line of stats */
         /* level hitroll ac hp_dice mana_dice */
-        diku_fread_number(fp, &mob->level);
-        diku_fread_number(fp, &mob->hitroll);
+        diku_lexer_read_number(lex, &mob->level);
+        diku_lexer_read_number(lex, &mob->hitroll);
         
         int ac, hp_num, hp_type, hp_bonus;
-        diku_fread_number(fp, &ac);
+        diku_lexer_read_number(lex, &ac);
         mob->ac[0] = mob->ac[1] = mob->ac[2] = mob->ac[3] = ac;
         
-        diku_fread_number(fp, &hp_num);
-        diku_fread_number(fp, &hp_type);
-        diku_fread_number(fp, &hp_bonus);
+        diku_lexer_read_number(lex, &hp_num);
+        diku_lexer_read_number(lex, &hp_type);
+        diku_lexer_read_number(lex, &hp_bonus);
         mob->hit[0] = hp_num;
         mob->hit[1] = hp_type;
         mob->hit[2] = hp_bonus;
         
         /* Skip mana/damage for simple format */
-        diku_fread_to_endline(fp);
+        diku_lexer_skip_line(lex);
         
     } else if (format_letter == 'C' || format_letter == 'c') {
         /* Complex format (ROM) */
         /* level hitroll hp_dice mana_dice damage_dice */
-        diku_fread_number(fp, &mob->level);
-        diku_fread_number(fp, &mob->hitroll);
+        diku_lexer_read_number(lex, &mob->level);
+        diku_lexer_read_number(lex, &mob->hitroll);
         
-        diku_fread_number(fp, &mob->hit[0]);
-        diku_fread_number(fp, &mob->hit[1]);
-        diku_fread_number(fp, &mob->hit[2]);
+        diku_lexer_read_number(lex, &mob->hit[0]);
+        diku_lexer_read_number(lex, &mob->hit[1]);
+        diku_lexer_read_number(lex, &mob->hit[2]);
         
-        diku_fread_number(fp, &mob->mana[0]);
-        diku_fread_number(fp, &mob->mana[1]);
-        diku_fread_number(fp, &mob->mana[2]);
+        diku_lexer_read_number(lex, &mob->mana[0]);
+        diku_lexer_read_number(lex, &mob->mana[1]);
+        diku_lexer_read_number(lex, &mob->mana[2]);
         
-        diku_fread_number(fp, &mob->damage[0]);
-        diku_fread_number(fp, &mob->damage[1]);
-        diku_fread_number(fp, &mob->damage[2]);
+        diku_lexer_read_number(lex, &mob->damage[0]);
+        diku_lexer_read_number(lex, &mob->damage[1]);
+        diku_lexer_read_number(lex, &mob->damage[2]);
         
         /* damage type */
-        diku_fread_to_endline(fp);
+        diku_lexer_skip_line(lex);
         
         /* AC line */
-        diku_fread_number(fp, &mob->ac[0]);  /* pierce */
-        diku_fread_number(fp, &mob->ac[1]);  /* bash */
-        diku_fread_number(fp, &mob->ac[2]);  /* slash */
-        diku_fread_number(fp, &mob->ac[3]);  /* exotic */
-        diku_fread_to_endline(fp);
+        diku_lexer_read_number(lex, &mob->ac[0]);  /* pierce */
+        diku_lexer_read_number(lex, &mob->ac[1]);  /* bash */
+        diku_lexer_read_number(lex, &mob->ac[2]);  /* slash */
+        diku_lexer_read_number(lex, &mob->ac[3]);  /* exotic */
+        diku_lexer_skip_line(lex);
         
         /* Offensive flags, immunities, resistances, vulnerabilities */
-        skip_whitespace(fp);
-        if (fscanf(fp, "%255s", buf) == 1) {
+        diku_lexer_skip_ws(lex);
+        if (diku_lexer_read_word(lex, buf, 255)) {
             mob->off_flags = (uint32_t)strtol(buf, NULL, 0);
         }
-        if (fscanf(fp, "%255s", buf) == 1) {
+        if (diku_lexer_read_word(lex, buf, 255)) {
             mob->imm_flags = (uint32_t)strtol(buf, NULL, 0);
         }
-        if (fscanf(fp, "%255s", buf) == 1) {
+        if (diku_lexer_read_word(lex, buf, 255)) {
             mob->res_flags = (uint32_t)strtol(buf, NULL, 0);
         }
-        if (fscanf(fp, "%255s", buf) == 1) {
+        if (diku_lexer_read_word(lex, buf, 255)) {
             mob->vuln_flags = (uint32_t)strtol(buf, NULL, 0);
         }
-        diku_fread_to_endline(fp);
+        diku_lexer_skip_line(lex);
         
         /* Start pos, default pos, sex, wealth */
-        diku_fread_number(fp, &mob->start_pos);
-        diku_fread_number(fp, &mob->default_pos);
-        diku_fread_number(fp, &mob->sex);
+        diku_lexer_read_number(lex, &mob->start_pos);
+        diku_lexer_read_number(lex, &mob->default_pos);
+        diku_lexer_read_number(lex, &mob->sex);
         
-        skip_whitespace(fp);
-        if (fscanf(fp, "%255s", buf) == 1) {
+        diku_lexer_skip_ws(lex);
+        if (diku_lexer_read_word(lex, buf, 255)) {
             /* Could be gold or race depending on fork */
             if (isdigit(buf[0])) {
                 mob->gold = strtol(buf, NULL, 0);
             }
         }
-        diku_fread_to_endline(fp);
+        diku_lexer_skip_line(lex);
         
     } else {
         /* Unknown format - store raw lines */
         /* Just skip for now */
-        diku_fread_to_endline(fp);
+        diku_lexer_skip_line(lex);
     }
     
     /* Parse any extra lines (F lines for form, etc) */
-    long pos = ftell(fp);
+    long pos = diku_lexer_tell(lex);
     int next_c;
-    while ((next_c = fgetc(fp)) != EOF) {
-        if (next_c == '#' || (next_c == '0' && (next_c = fgetc(fp)) == '\n')) {
+    while ((next_c = diku_lexer_getc(lex)) != EOF) {
+        if (next_c == '#' || (next_c == '0' && (next_c = diku_lexer_getc(lex)) == '\n')) {
             /* Next mobile or end of section */
-            fseek(fp, pos, SEEK_SET);
+            diku_lexer_seek(lex, pos);
             break;
         }
         if (next_c == 'F') {
             /* Form line - skip for now */
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
         } else if (next_c == 'M') {
             /* Material line */
-            mob->material = diku_fread_string(fp, arena);
+            mob->material = diku_lexer_read_string(lex, arena);
         } else if (next_c != '\n' && next_c != '\r') {
             /* Unknown - skip */
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
         }
-        pos = ftell(fp);
+        pos = diku_lexer_tell(lex);
     }
     
     return mob;
@@ -826,43 +912,43 @@ mobile_t *diku_parse_mobile(FILE *fp, arena_t *arena, int *vnum_out) {
 /* Item/Object parser                                                 */
 /* ------------------------------------------------------------------ */
 
-item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
-    long start_pos = ftell(fp);
+item_t *diku_parse_item(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out) {
+    long start_pos = diku_lexer_tell(lex);
     int vnum;
-    if (diku_fread_number(fp, &vnum) != 0) {
+    if (diku_lexer_read_number(lex, &vnum) != 0) {
         return NULL;
     }
     
     *vnum_out = vnum;
     
-    item_t *item = (item_t *)arena_alloc_aligned(arena, sizeof(item_t), 64);
+    item_t *item = (item_t *)diku_arena_alloc_aligned(arena, sizeof(item_t), 64);
     if (!item) return NULL;
     
     memset(item, 0, sizeof(item_t));
     item->vnum = vnum;
     
     /* Name (keywords) */
-    item->name = diku_fread_string(fp, arena);
+    item->name = diku_lexer_read_string(lex, arena);
     
     /* Short description */
-    item->short_desc = diku_fread_string(fp, arena);
+    item->short_desc = diku_lexer_read_string(lex, arena);
     
     /* Long description */
-    item->long_desc = diku_fread_string(fp, arena);
+    item->long_desc = diku_lexer_read_string(lex, arena);
     
     /* Description (can be ~ for none, or omitted entirely in some forks) */
-    skip_whitespace(fp);
-    int desc_peek = fgetc(fp);
+    diku_lexer_skip_ws(lex);
+    int desc_peek = diku_lexer_getc(lex);
     if (desc_peek != EOF) {
         if (desc_peek == '~') {
             /* Empty description */
         } else if (isdigit(desc_peek) || desc_peek == '#' || desc_peek == '0') {
             /* No description - next field is numeric data or section marker */
-            ungetc(desc_peek, fp);
+            diku_lexer_ungetc(lex, desc_peek);
         } else {
             /* Has a description string */
-            ungetc(desc_peek, fp);
-            diku_string_t desc = diku_fread_string(fp, arena);
+            diku_lexer_ungetc(lex, desc_peek);
+            diku_string_t desc = diku_lexer_read_string(lex, arena);
             if (desc.len > 0 && strcmp(desc.str, "") != 0) {
                 item->description = desc;
             }
@@ -870,30 +956,30 @@ item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
     }
     
     /* Safety: if we hit a section boundary, the item is missing numeric data */
-    skip_whitespace(fp);
-    long boundary_pos = ftell(fp);
-    int boundary_c = fgetc(fp);
+    diku_lexer_skip_ws(lex);
+    long boundary_pos = diku_lexer_tell(lex);
+    int boundary_c = diku_lexer_getc(lex);
     if (boundary_c == '#') {
-        int boundary_next = fgetc(fp);
+        int boundary_next = diku_lexer_getc(lex);
         if (boundary_next == '0') {
             /* End of section */
-            fseek(fp, boundary_pos, SEEK_SET);
+            diku_lexer_seek(lex, boundary_pos);
             return item;
         } else if (boundary_next != EOF) {
-            ungetc(boundary_next, fp);
+            diku_lexer_ungetc(lex, boundary_next);
         }
     }
     if (boundary_c != EOF) {
-        ungetc(boundary_c, fp);
+        diku_lexer_ungetc(lex, boundary_c);
     }
     
     /* Type, extra flags, wear flags */
-    skip_whitespace(fp);
-    diku_fread_number(fp, &item->type);
+    diku_lexer_skip_ws(lex);
+    diku_lexer_read_number(lex, &item->type);
     
     /* Flags can be numeric or bitstring */
     char buf[256];
-    if (fscanf(fp, "%255s", buf) == 1) {
+    if (diku_lexer_read_word(lex, buf, 255)) {
         if (isdigit(buf[0]) || buf[0] == '-') {
             item->extra_flags = (uint32_t)strtol(buf, NULL, 0);
         } else {
@@ -908,7 +994,7 @@ item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
         }
     }
     
-    if (fscanf(fp, "%255s", buf) == 1) {
+    if (diku_lexer_read_word(lex, buf, 255)) {
         if (isdigit(buf[0]) || buf[0] == '-') {
             item->wear_flags = (uint32_t)strtol(buf, NULL, 0);
         } else {
@@ -922,36 +1008,36 @@ item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
             item->wear_flags = flags;
         }
     }
-    diku_fread_to_endline(fp);
+    diku_lexer_skip_line(lex);
     
     /* Values (4 or 5 depending on fork) */
-    skip_whitespace(fp);
+    diku_lexer_skip_ws(lex);
     for (int i = 0; i < 4; i++) {
-        diku_fread_number(fp, &item->value[i]);
+        diku_lexer_read_number(lex, &item->value[i]);
     }
-    diku_fread_to_endline(fp);
+    diku_lexer_skip_line(lex);
     
     /* Weight, cost, level (optional) */
-    skip_whitespace(fp);
-    diku_fread_number(fp, &item->weight);
-    diku_fread_number(fp, &item->cost);
+    diku_lexer_skip_ws(lex);
+    diku_lexer_read_number(lex, &item->weight);
+    diku_lexer_read_number(lex, &item->cost);
     
     /* Try to read level - may not exist */
-    long pos = ftell(fp);
+    long pos = diku_lexer_tell(lex);
     int level;
-    if (diku_fread_number(fp, &level) == 0) {
+    if (diku_lexer_read_number(lex, &level) == 0) {
         item->level = level;
     } else {
-        fseek(fp, pos, SEEK_SET);
+        diku_lexer_seek(lex, pos);
     }
-    diku_fread_to_endline(fp);
+    diku_lexer_skip_line(lex);
     
     /* Parse extra lines (A for affects, E for extra descs, L for level, etc) */
-    pos = ftell(fp);
+    pos = diku_lexer_tell(lex);
     int next_c;
-    while ((next_c = fgetc(fp)) != EOF) {
-        if (next_c == '#' || (next_c == '0' && (next_c = fgetc(fp)) == '\n')) {
-            fseek(fp, pos, SEEK_SET);
+    while ((next_c = diku_lexer_getc(lex)) != EOF) {
+        if (next_c == '#' || (next_c == '0' && (next_c = diku_lexer_getc(lex)) == '\n')) {
+            diku_lexer_seek(lex, pos);
             break;
         }
         
@@ -959,7 +1045,7 @@ item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
             int idx = item->affect_count++;
             size_t new_size = item->affect_count * sizeof(*item->affects);
             
-            void *new_array = arena_alloc(arena, new_size);
+            void *new_array = diku_arena_alloc(arena, new_size);
             if (new_array && item->affects) {
                 memcpy(new_array, item->affects, (item->affect_count - 1) * sizeof(*item->affects));
                 item->affects = new_array;
@@ -968,16 +1054,16 @@ item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
             }
             
             if (item->affects) {
-                diku_fread_number(fp, &item->affects[idx].location);
-                diku_fread_number(fp, &item->affects[idx].modifier);
+                diku_lexer_read_number(lex, &item->affects[idx].location);
+                diku_lexer_read_number(lex, &item->affects[idx].modifier);
             }
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
             
         } else if (next_c == 'E') {  /* Extra description */
             int idx = item->extra_desc_count++;
             size_t new_size = item->extra_desc_count * sizeof(*item->extra_descs);
             
-            void *new_array = arena_alloc(arena, new_size);
+            void *new_array = diku_arena_alloc(arena, new_size);
             if (new_array && item->extra_descs) {
                 memcpy(new_array, item->extra_descs, (item->extra_desc_count - 1) * sizeof(*item->extra_descs));
                 item->extra_descs = new_array;
@@ -986,22 +1072,22 @@ item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
             }
             
             if (item->extra_descs) {
-                item->extra_descs[idx].keywords = diku_fread_string(fp, arena);
-                item->extra_descs[idx].desc = diku_fread_string(fp, arena);
+                item->extra_descs[idx].keywords = diku_lexer_read_string(lex, arena);
+                item->extra_descs[idx].desc = diku_lexer_read_string(lex, arena);
             }
             
         } else if (next_c == 'L') {  /* Level (alternative) */
-            diku_fread_number(fp, &item->level);
-            diku_fread_to_endline(fp);
+            diku_lexer_read_number(lex, &item->level);
+            diku_lexer_skip_line(lex);
             
         } else if (next_c == 'M') {  /* Material */
-            item->material = diku_fread_string(fp, arena);
+            item->material = diku_lexer_read_string(lex, arena);
             
         } else if (next_c != '\n' && next_c != '\r') {
-            diku_fread_to_endline(fp);
+            diku_lexer_skip_line(lex);
         }
         
-        pos = ftell(fp);
+        pos = diku_lexer_tell(lex);
     }
     
     return item;
@@ -1011,41 +1097,41 @@ item_t *diku_parse_item(FILE *fp, arena_t *arena, int *vnum_out) {
 /* Classic multi-file section parsers (CircleMUD / original DikuMUD)  */
 /* ------------------------------------------------------------------ */
 
-bool diku_parse_wld_fp(FILE *fp, area_t *area) {
-    if (!fp || !area) return false;
+bool diku_parse_wld(diku_lexer_t *lex, area_t *area) {
+    if (!lex || !area) return false;
     
     int room_capacity = 16;
     if (area->room_count > 0) {
         room_capacity = area->room_count * 2;
-        room_t *new_rooms = (room_t *)arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
+        room_t *new_rooms = (room_t *)diku_arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
         if (new_rooms && area->rooms) {
             memcpy(new_rooms, area->rooms, area->room_count * sizeof(room_t));
             area->rooms = new_rooms;
         }
     } else {
-        area->rooms = (room_t *)arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
+        area->rooms = (room_t *)diku_arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
     }
     
     int parsed = 0;
     while (1) {
-        skip_whitespace(fp);
-        int c = fgetc(fp);
+        diku_lexer_skip_ws(lex);
+        int c = diku_lexer_getc(lex);
         if (c == EOF) break;
         if (c == '$') break;
         if (c == '#') {
-            int next = fgetc(fp);
+            int next = diku_lexer_getc(lex);
             if (next == '$' || next == '0') {
                 break;
             }
             if (isdigit(next)) {
-                ungetc(next, fp);
+                diku_lexer_ungetc(lex, next);
                 int vnum;
-                room_t *room = diku_parse_room(fp, area->arena, &vnum);
+                room_t *room = diku_parse_room(lex, area->arena, &vnum);
                 if (!room) break;
                 
                 if (area->room_count >= room_capacity) {
                     room_capacity *= 2;
-                    room_t *new_rooms = (room_t *)arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
+                    room_t *new_rooms = (room_t *)diku_arena_alloc_aligned(area->arena, sizeof(room_t) * room_capacity, 64);
                     if (new_rooms && area->rooms) {
                         memcpy(new_rooms, area->rooms, area->room_count * sizeof(room_t));
                         area->rooms = new_rooms;
@@ -1058,50 +1144,50 @@ bool diku_parse_wld_fp(FILE *fp, area_t *area) {
                 parsed++;
                 continue;
             }
-            if (next != EOF) ungetc(next, fp);
+            if (next != EOF) diku_lexer_ungetc(lex, next);
         }
-        if (c != EOF) ungetc(c, fp);
-        diku_fread_to_endline(fp);
+        if (c != EOF) diku_lexer_ungetc(lex, c);
+        diku_lexer_skip_line(lex);
     }
     
     return parsed > 0;
 }
 
-bool diku_parse_mob_fp(FILE *fp, area_t *area) {
-    if (!fp || !area) return false;
+bool diku_parse_mob(diku_lexer_t *lex, area_t *area) {
+    if (!lex || !area) return false;
     
     int mob_capacity = 16;
     if (area->mobile_count > 0) {
         mob_capacity = area->mobile_count * 2;
-        mobile_t *new_mobs = (mobile_t *)arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
+        mobile_t *new_mobs = (mobile_t *)diku_arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
         if (new_mobs && area->mobiles) {
             memcpy(new_mobs, area->mobiles, area->mobile_count * sizeof(mobile_t));
             area->mobiles = new_mobs;
         }
     } else {
-        area->mobiles = (mobile_t *)arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
+        area->mobiles = (mobile_t *)diku_arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
     }
     
     int parsed = 0;
     while (1) {
-        skip_whitespace(fp);
-        int c = fgetc(fp);
+        diku_lexer_skip_ws(lex);
+        int c = diku_lexer_getc(lex);
         if (c == EOF) break;
         if (c == '$') break;
         if (c == '#') {
-            int next = fgetc(fp);
+            int next = diku_lexer_getc(lex);
             if (next == '$' || next == '0') {
                 break;
             }
             if (isdigit(next)) {
-                ungetc(next, fp);
+                diku_lexer_ungetc(lex, next);
                 int vnum;
-                mobile_t *mob = diku_parse_mobile(fp, area->arena, &vnum);
+                mobile_t *mob = diku_parse_mobile(lex, area->arena, &vnum);
                 if (!mob) break;
                 
                 if (area->mobile_count >= mob_capacity) {
                     mob_capacity *= 2;
-                    mobile_t *new_mobs = (mobile_t *)arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
+                    mobile_t *new_mobs = (mobile_t *)diku_arena_alloc_aligned(area->arena, sizeof(mobile_t) * mob_capacity, 64);
                     if (new_mobs && area->mobiles) {
                         memcpy(new_mobs, area->mobiles, area->mobile_count * sizeof(mobile_t));
                         area->mobiles = new_mobs;
@@ -1114,50 +1200,50 @@ bool diku_parse_mob_fp(FILE *fp, area_t *area) {
                 parsed++;
                 continue;
             }
-            if (next != EOF) ungetc(next, fp);
+            if (next != EOF) diku_lexer_ungetc(lex, next);
         }
-        if (c != EOF) ungetc(c, fp);
-        diku_fread_to_endline(fp);
+        if (c != EOF) diku_lexer_ungetc(lex, c);
+        diku_lexer_skip_line(lex);
     }
     
     return parsed > 0;
 }
 
-bool diku_parse_obj_fp(FILE *fp, area_t *area) {
-    if (!fp || !area) return false;
+bool diku_parse_obj(diku_lexer_t *lex, area_t *area) {
+    if (!lex || !area) return false;
     
     int item_capacity = 16;
     if (area->item_count > 0) {
         item_capacity = area->item_count * 2;
-        item_t *new_items = (item_t *)arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
+        item_t *new_items = (item_t *)diku_arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
         if (new_items && area->items) {
             memcpy(new_items, area->items, area->item_count * sizeof(item_t));
             area->items = new_items;
         }
     } else {
-        area->items = (item_t *)arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
+        area->items = (item_t *)diku_arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
     }
     
     int parsed = 0;
     while (1) {
-        skip_whitespace(fp);
-        int c = fgetc(fp);
+        diku_lexer_skip_ws(lex);
+        int c = diku_lexer_getc(lex);
         if (c == EOF) break;
         if (c == '$') break;
         if (c == '#') {
-            int next = fgetc(fp);
+            int next = diku_lexer_getc(lex);
             if (next == '$' || next == '0') {
                 break;
             }
             if (isdigit(next)) {
-                ungetc(next, fp);
+                diku_lexer_ungetc(lex, next);
                 int vnum;
-                item_t *item = diku_parse_item(fp, area->arena, &vnum);
+                item_t *item = diku_parse_item(lex, area->arena, &vnum);
                 if (!item) break;
                 
                 if (area->item_count >= item_capacity) {
                     item_capacity *= 2;
-                    item_t *new_items = (item_t *)arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
+                    item_t *new_items = (item_t *)diku_arena_alloc_aligned(area->arena, sizeof(item_t) * item_capacity, 64);
                     if (new_items && area->items) {
                         memcpy(new_items, area->items, area->item_count * sizeof(item_t));
                         area->items = new_items;
@@ -1170,45 +1256,45 @@ bool diku_parse_obj_fp(FILE *fp, area_t *area) {
                 parsed++;
                 continue;
             }
-            if (next != EOF) ungetc(next, fp);
+            if (next != EOF) diku_lexer_ungetc(lex, next);
         }
-        if (c != EOF) ungetc(c, fp);
-        diku_fread_to_endline(fp);
+        if (c != EOF) diku_lexer_ungetc(lex, c);
+        diku_lexer_skip_line(lex);
     }
     
     return parsed > 0;
 }
 
-bool diku_parse_zon_fp(FILE *fp, area_t *area) {
-    if (!fp || !area) return false;
+bool diku_parse_zon(diku_lexer_t *lex, area_t *area) {
+    if (!lex || !area) return false;
     
-    skip_whitespace(fp);
+    diku_lexer_skip_ws(lex);
     
     /* Optional zone number header: #<num> */
-    int c = fgetc(fp);
+    int c = diku_lexer_getc(lex);
     if (c == '#') {
         int zone_num;
-        diku_fread_number(fp, &zone_num);
-        skip_whitespace(fp);
-        c = fgetc(fp);
+        diku_lexer_read_number(lex, &zone_num);
+        diku_lexer_skip_ws(lex);
+        c = diku_lexer_getc(lex);
     }
-    if (c != EOF) ungetc(c, fp);
+    if (c != EOF) diku_lexer_ungetc(lex, c);
     
     /* Zone name */
-    diku_string_t name = diku_fread_string(fp, area->arena);
+    diku_string_t name = diku_lexer_read_string(lex, area->arena);
     if (name.len > 0 && (!area->name.str || area->name.len == 0)) {
         area->name = name;
     }
     
     /* Header numbers: top_vnum lifespan reset_mode ... */
-    diku_fread_to_endline(fp);
+    diku_lexer_skip_line(lex);
     
     /* Read reset commands until S or $ */
     char **lines = NULL;
     int count = 0;
     char buf[4096];
     
-    while (fgets(buf, sizeof(buf), fp)) {
+    while (diku_lexer_read_line(lex, buf, sizeof(buf))) {
         size_t len = strlen(buf);
         while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) {
             buf[--len] = '\0';
@@ -1221,13 +1307,13 @@ bool diku_parse_zon_fp(FILE *fp, area_t *area) {
         }
         
         count++;
-        char **new_lines = (char **)arena_alloc(area->arena, count * sizeof(char *));
+        char **new_lines = (char **)diku_arena_alloc(area->arena, count * sizeof(char *));
         if (new_lines && lines) {
             memcpy(new_lines, lines, (count - 1) * sizeof(char *));
         }
         lines = new_lines;
         if (lines) {
-            lines[count - 1] = arena_strdup(area->arena, buf);
+            lines[count - 1] = diku_arena_strdup(area->arena, buf);
         }
     }
     
@@ -1239,43 +1325,50 @@ bool diku_parse_zon_fp(FILE *fp, area_t *area) {
 }
 
 area_t *diku_parse_package_files(const char *wld, const char *mob, const char *obj, const char *zon) {
-    arena_t *arena = arena_create();
+    memento_arena_t *arena = diku_arena_create();
     if (!arena) return NULL;
     
-    area_t *area = (area_t *)arena_alloc_aligned(arena, sizeof(area_t), 64);
+    area_t *area = (area_t *)diku_arena_alloc_aligned(arena, sizeof(area_t), 64);
     if (!area) {
-        arena_free_all(arena);
+        diku_arena_free_all(arena);
         return NULL;
     }
     memset(area, 0, sizeof(area_t));
     area->arena = arena;
     
     bool has_data = false;
-    FILE *fp;
     
-    fp = fopen(wld, "r");
-    if (fp) {
-        area->filename = arena_strndup(arena, wld, strlen(wld));
-        if (diku_parse_wld_fp(fp, area)) has_data = true;
-        fclose(fp);
+    {
+        diku_lexer_t file_lex;
+        if (diku_lexer_init_file(&file_lex, wld)) {
+            area->filename = diku_arena_strndup(arena, wld, strlen(wld));
+            if (diku_parse_wld(&file_lex, area)) has_data = true;
+            diku_lexer_cleanup(&file_lex);
+        }
     }
     
-    fp = fopen(mob, "r");
-    if (fp) {
-        if (diku_parse_mob_fp(fp, area)) has_data = true;
-        fclose(fp);
+    {
+        diku_lexer_t file_lex;
+        if (diku_lexer_init_file(&file_lex, mob)) {
+            if (diku_parse_mob(&file_lex, area)) has_data = true;
+            diku_lexer_cleanup(&file_lex);
+        }
     }
     
-    fp = fopen(obj, "r");
-    if (fp) {
-        if (diku_parse_obj_fp(fp, area)) has_data = true;
-        fclose(fp);
+    {
+        diku_lexer_t file_lex;
+        if (diku_lexer_init_file(&file_lex, obj)) {
+            if (diku_parse_obj(&file_lex, area)) has_data = true;
+            diku_lexer_cleanup(&file_lex);
+        }
     }
     
-    fp = fopen(zon, "r");
-    if (fp) {
-        if (diku_parse_zon_fp(fp, area)) has_data = true;
-        fclose(fp);
+    {
+        diku_lexer_t file_lex;
+        if (diku_lexer_init_file(&file_lex, zon)) {
+            if (diku_parse_zon(&file_lex, area)) has_data = true;
+            diku_lexer_cleanup(&file_lex);
+        }
     }
     
     if (!has_data) {
@@ -1412,19 +1505,21 @@ area_t *diku_load_folder_packages(const char *folder_path) {
 /* Store raw section (for resets, shops, etc)                         */
 /* ------------------------------------------------------------------ */
 
-static char **store_raw_section(FILE *fp, arena_t *arena, int *line_count) {
+static char **store_raw_section(diku_lexer_t *lex, memento_arena_t *arena, int *line_count) {
     char **lines = NULL;
     int count = 0;
     
     char buf[4096];
-    while (fgets(buf, sizeof(buf), fp)) {
+    while (1) {
+        long line_pos = diku_lexer_tell(lex);
+        if (!diku_lexer_read_line(lex, buf, sizeof(buf))) break;
         /* Check for end of section */
         if (buf[0] == '0' && (buf[1] == '\n' || buf[1] == '\r' || buf[1] == '\0')) {
             break;
         }
         if (buf[0] == '#') {
-            /* Next section */
-            fseek(fp, -(long)strlen(buf), SEEK_CUR);
+            /* Next section - seek back */
+            diku_lexer_seek(lex, line_pos);
             break;
         }
         
@@ -1438,7 +1533,7 @@ static char **store_raw_section(FILE *fp, arena_t *arena, int *line_count) {
         while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
             buf[--len] = '\0';
         
-        lines[count - 1] = arena_strdup(arena, buf);
+        lines[count - 1] = diku_arena_strdup(arena, buf);
     }
     
     *line_count = count;
@@ -1449,23 +1544,23 @@ static char **store_raw_section(FILE *fp, arena_t *arena, int *line_count) {
 /* Main file parser                                                   */
 /* ------------------------------------------------------------------ */
 
-area_t *diku_parse_fp(FILE *fp, const char *filename) {
-    if (!fp) return NULL;
+area_t *diku_parse_lexer(diku_lexer_t *lex, const char *filename) {
+    if (!lex) return NULL;
     
-    arena_t *arena = arena_create();
+    memento_arena_t *arena = diku_arena_create();
     if (!arena) return NULL;
     
-    area_t *area = diku_parse_area_header(fp, arena);
+    area_t *area = diku_parse_area_header(lex, arena);
     if (!area) {
-        arena_free_all(arena);
+        diku_arena_free_all(arena);
         return NULL;
     }
     
-    area->filename = arena_strndup(arena, filename, strlen(filename));
+    area->filename = diku_arena_strndup(arena, filename, strlen(filename));
     
     /* Parse sections */
     char buf[256];
-    while (fscanf(fp, "%255s", buf) == 1) {
+    while (diku_lexer_read_word(lex, buf, 255)) {
         if (buf[0] != '#') {
             /* Not a section marker */
             continue;
@@ -1476,7 +1571,7 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
         if (strcmp(section, "ROOMS") == 0) {
             /* Parse rooms */
             int room_capacity = 16;
-            area->rooms = (room_t *)arena_alloc_aligned(arena, sizeof(room_t) * room_capacity, 64);
+            area->rooms = (room_t *)diku_arena_alloc_aligned(arena, sizeof(room_t) * room_capacity, 64);
             if (!area->rooms) {
                 fprintf(stderr, "ERROR: Failed to allocate rooms array\n");
                 continue;
@@ -1484,19 +1579,19 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
             
             int vnum;
             while (1) {
-                skip_whitespace(fp);
-                long pos = ftell(fp);
+                diku_lexer_skip_ws(lex);
+                long pos = diku_lexer_tell(lex);
                 
                 /* Check for end of rooms */
-                int c = fgetc(fp);
+                int c = diku_lexer_getc(lex);
                 if (c == '#') {
                     char next[16];
-                    if (fscanf(fp, "%15s", next) == 1) {
+                    if (diku_lexer_read_word(lex, next, 16)) {
                         if (strcmp(next, "0") == 0) {
                             break;  /* End of rooms */
                         } else {
                             /* It's a room vnum - skip the # and position after it */
-                            fseek(fp, pos + 1, SEEK_SET);
+                            diku_lexer_seek(lex, pos + 1);
                         }
                     }
                 } else if (c == '0') {
@@ -1504,15 +1599,15 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                 } else if (c == EOF) {
                     break;
                 } else {
-                    fseek(fp, pos, SEEK_SET);
-                    diku_fread_to_endline(fp);
+                    diku_lexer_seek(lex, pos);
+                    diku_lexer_skip_line(lex);
                     continue;
                 }
                 
                 /* Parse room */
-                room_t *room = diku_parse_room(fp, arena, &vnum);
+                room_t *room = diku_parse_room(lex, arena, &vnum);
                 if (!room) {
-                    fprintf(stderr, "diku_parse_room NULL at pos %ld\n", ftell(fp));
+                    fprintf(stderr, "diku_parse_room NULL at pos %ld\n", diku_lexer_tell(lex));
                     break;
                 }
                 fprintf(stderr, "ROOM #%d %s\n", vnum, room->name.str ? room->name.str : "");
@@ -1520,7 +1615,7 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                 /* Grow array if needed */
                 if (area->room_count >= room_capacity) {
                     room_capacity *= 2;
-                    room_t *new_rooms = (room_t *)arena_alloc_aligned(arena, sizeof(room_t) * room_capacity, 64);
+                    room_t *new_rooms = (room_t *)diku_arena_alloc_aligned(arena, sizeof(room_t) * room_capacity, 64);
                     memcpy(new_rooms, area->rooms, area->room_count * sizeof(room_t));
                     area->rooms = new_rooms;
                 }
@@ -1531,21 +1626,21 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
         } else if (strcmp(section, "MOBILES") == 0 || strcmp(section, "MOBILE") == 0) {
             /* Parse mobiles */
             int mob_capacity = 16;
-            area->mobiles = (mobile_t *)arena_alloc_aligned(arena, sizeof(mobile_t) * mob_capacity, 64);
+            area->mobiles = (mobile_t *)diku_arena_alloc_aligned(arena, sizeof(mobile_t) * mob_capacity, 64);
             
             int vnum;
             while (1) {
-                skip_whitespace(fp);
-                long pos = ftell(fp);
+                diku_lexer_skip_ws(lex);
+                long pos = diku_lexer_tell(lex);
                 
-                int c = fgetc(fp);
+                int c = diku_lexer_getc(lex);
                 if (c == '#') {
                     char next[16];
-                    if (fscanf(fp, "%15s", next) == 1) {
+                    if (diku_lexer_read_word(lex, next, 16)) {
                         if (strcmp(next, "0") == 0) {
                             break;
                         } else {
-                            fseek(fp, pos + 1, SEEK_SET);
+                            diku_lexer_seek(lex, pos + 1);
                         }
                     }
                 } else if (c == '0') {
@@ -1553,17 +1648,17 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                 } else if (c == EOF) {
                     break;
                 } else {
-                    fseek(fp, pos, SEEK_SET);
-                    diku_fread_to_endline(fp);
+                    diku_lexer_seek(lex, pos);
+                    diku_lexer_skip_line(lex);
                     continue;
                 }
                 
-                mobile_t *mob = diku_parse_mobile(fp, arena, &vnum);
+                mobile_t *mob = diku_parse_mobile(lex, arena, &vnum);
                 if (!mob) break;
                 
                 if (area->mobile_count >= mob_capacity) {
                     mob_capacity *= 2;
-                    mobile_t *new_mobs = (mobile_t *)arena_alloc_aligned(arena, sizeof(mobile_t) * mob_capacity, 64);
+                    mobile_t *new_mobs = (mobile_t *)diku_arena_alloc_aligned(arena, sizeof(mobile_t) * mob_capacity, 64);
                     memcpy(new_mobs, area->mobiles, area->mobile_count * sizeof(mobile_t));
                     area->mobiles = new_mobs;
                 }
@@ -1576,21 +1671,21 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
 
             /* Parse items */
             int item_capacity = 16;
-            area->items = (item_t *)arena_alloc_aligned(arena, sizeof(item_t) * item_capacity, 64);
+            area->items = (item_t *)diku_arena_alloc_aligned(arena, sizeof(item_t) * item_capacity, 64);
             
             int vnum;
             while (1) {
-                skip_whitespace(fp);
-                long pos = ftell(fp);
+                diku_lexer_skip_ws(lex);
+                long pos = diku_lexer_tell(lex);
                 
-                int c = fgetc(fp);
+                int c = diku_lexer_getc(lex);
                 if (c == '#') {
                     char next[16];
-                    if (fscanf(fp, "%15s", next) == 1) {
+                    if (diku_lexer_read_word(lex, next, 16)) {
                         if (strcmp(next, "0") == 0) {
                             break;
                         } else {
-                            fseek(fp, pos + 1, SEEK_SET);
+                            diku_lexer_seek(lex, pos + 1);
                         }
                     }
                 } else if (c == '0') {
@@ -1598,12 +1693,12 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                 } else if (c == EOF) {
                     break;
                 } else {
-                    fseek(fp, pos, SEEK_SET);
-                    diku_fread_to_endline(fp);
+                    diku_lexer_seek(lex, pos);
+                    diku_lexer_skip_line(lex);
                     continue;
                 }
                 
-                item_t *item = diku_parse_item(fp, arena, &vnum);
+                item_t *item = diku_parse_item(lex, arena, &vnum);
 
                 if (!item) {
                     break;
@@ -1611,7 +1706,7 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
                 
                 if (area->item_count >= item_capacity) {
                     item_capacity *= 2;
-                    item_t *new_items = (item_t *)arena_alloc_aligned(arena, sizeof(item_t) * item_capacity, 64);
+                    item_t *new_items = (item_t *)diku_arena_alloc_aligned(arena, sizeof(item_t) * item_capacity, 64);
                     memcpy(new_items, area->items, area->item_count * sizeof(item_t));
                     area->items = new_items;
                 }
@@ -1620,19 +1715,19 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
             }
             
         } else if (strcmp(section, "HELPS") == 0) {
-            area->helps_raw = store_raw_section(fp, arena, &area->helps_line_count);
+            area->helps_raw = store_raw_section(lex, arena, &area->helps_line_count);
             
         } else if (strcmp(section, "RESETS") == 0 || strcmp(section, "RESET") == 0) {
-            area->resets_raw = store_raw_section(fp, arena, &area->resets_line_count);
+            area->resets_raw = store_raw_section(lex, arena, &area->resets_line_count);
             
         } else if (strcmp(section, "SHOPS") == 0 || strcmp(section, "SHOP") == 0) {
-            area->shops_raw = store_raw_section(fp, arena, &area->shops_line_count);
+            area->shops_raw = store_raw_section(lex, arena, &area->shops_line_count);
             
         } else if (strcmp(section, "SPECIALS") == 0 || strcmp(section, "SPECIAL") == 0) {
-            area->specials_raw = store_raw_section(fp, arena, &area->specials_line_count);
+            area->specials_raw = store_raw_section(lex, arena, &area->specials_line_count);
             
         } else if (strcmp(section, "OBJFUNS") == 0 || strcmp(section, "OBJFUN") == 0) {
-            area->objfuns_raw = store_raw_section(fp, arena, &area->objfuns_line_count);
+            area->objfuns_raw = store_raw_section(lex, arena, &area->objfuns_line_count);
             
         } else if (strcmp(section, "$") == 0) {
             /* End of file */
@@ -1643,7 +1738,7 @@ area_t *diku_parse_fp(FILE *fp, const char *filename) {
             area->extra_section_count++;
             /* Use malloc for this since it's dynamic */
             /* For now, just skip the section */
-            store_raw_section(fp, arena, &(int){0});
+            store_raw_section(lex, arena, &(int){0});
         }
     }
     
@@ -1696,7 +1791,7 @@ void diku_parse_resets(area_t *area) {
                     /* Add mob to room */
                     int idx = room->room_mobile_count++;
                     size_t new_size = room->room_mobile_count * sizeof(mobile_t *);
-                    mobile_t **new_array = (mobile_t **)arena_alloc(area->arena, new_size);
+                    mobile_t **new_array = (mobile_t **)diku_arena_alloc(area->arena, new_size);
                     if (new_array && room->room_mobiles) {
                         memcpy(new_array, room->room_mobiles, idx * sizeof(mobile_t *));
                     }
@@ -1720,7 +1815,7 @@ void diku_parse_resets(area_t *area) {
                 if (item && room) {
                     int idx = room->room_item_count++;
                     size_t new_size = room->room_item_count * sizeof(item_t *);
-                    item_t **new_array = (item_t **)arena_alloc(area->arena, new_size);
+                    item_t **new_array = (item_t **)diku_arena_alloc(area->arena, new_size);
                     if (new_array && room->room_items) {
                         memcpy(new_array, room->room_items, idx * sizeof(item_t *));
                     }
@@ -1741,7 +1836,7 @@ void diku_parse_resets(area_t *area) {
                 if (item && last_mob) {
                     int idx = last_mob->inventory_count++;
                     size_t new_size = last_mob->inventory_count * sizeof(*last_mob->inventory);
-                    void *new_array = arena_alloc(area->arena, new_size);
+                    void *new_array = diku_arena_alloc(area->arena, new_size);
                     if (new_array && last_mob->inventory) {
                         memcpy(new_array, last_mob->inventory, idx * sizeof(*last_mob->inventory));
                     }
@@ -1764,7 +1859,7 @@ void diku_parse_resets(area_t *area) {
                 if (item && last_mob) {
                     int idx = last_mob->inventory_count++;
                     size_t new_size = last_mob->inventory_count * sizeof(*last_mob->inventory);
-                    void *new_array = arena_alloc(area->arena, new_size);
+                    void *new_array = diku_arena_alloc(area->arena, new_size);
                     if (new_array && last_mob->inventory) {
                         memcpy(new_array, last_mob->inventory, idx * sizeof(*last_mob->inventory));
                     }
@@ -1792,11 +1887,11 @@ void diku_parse_resets(area_t *area) {
 }
 
 area_t *diku_parse_file(const char *filename) {
-    FILE *fp = fopen(filename, "r");
-    if (fp) {
-        area_t *area = diku_parse_fp(fp, filename);
-        fclose(fp);
-        return area;
+    diku_lexer_t lex;
+    if (diku_lexer_init_file(&lex, filename)) {
+        area_t *area = diku_parse_lexer(&lex, filename);
+        diku_lexer_cleanup(&lex);
+        if (area) return area;
     }
     
     /* If not a regular file, try as a multi-file package base path */
@@ -2373,7 +2468,7 @@ void diku_free_area(area_t *area) {
     
     /* Save pointer to hash table (not in arena) */
     void *hash_table = area->rooms_by_vnum;
-    arena_t *arena = area->arena;
+    memento_arena_t *arena = area->arena;
     
     /* Free the hash table first */
     if (hash_table) {
@@ -2382,7 +2477,7 @@ void diku_free_area(area_t *area) {
     
     /* Free the arena - this frees everything else including the area struct */
     if (arena) {
-        arena_free_all(arena);
+        diku_arena_free_all(arena);
     }
 }
 
