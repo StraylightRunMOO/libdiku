@@ -8,6 +8,9 @@
 #include "diku/lexer.h"
 #include "diku/util.h"
 #include "diku/find.h"
+#include "diku/resets.h"
+#include "diku/sections.h"
+#include "diku/format.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,25 +22,15 @@ extern "C" {
 
 /* Lexer API — declared and implemented in diku/lexer.h */
 
-/* ------------------------------------------------------------------ */
-/* Section parsers & main entry points                                */
-/* ------------------------------------------------------------------ */
-area_t *diku_parse_area_header(diku_lexer_t *lex, memento_arena_t *arena);
-room_t *diku_parse_room(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out);
-mobile_t *diku_parse_mobile(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out);
-item_t *diku_parse_item(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out);
+/* Section parsers — declared and implemented in diku/sections.h */
 
 area_t *diku_parse_file(const char *filename);
 area_t *diku_parse_lexer(diku_lexer_t *lex, const char *filename);
-bool diku_parse_wld(diku_lexer_t *lex, area_t *area);
-bool diku_parse_mob(diku_lexer_t *lex, area_t *area);
-bool diku_parse_obj(diku_lexer_t *lex, area_t *area);
-bool diku_parse_zon(diku_lexer_t *lex, area_t *area);
 area_t *diku_parse_package(const char *base_path);
 area_t *diku_parse_package_files(const char *wld, const char *mob, const char *obj, const char *zon);
 area_t *diku_load_folder_are(const char *folder_path);
 area_t *diku_load_folder_packages(const char *folder_path);
-void diku_parse_resets(area_t *area);
+/* diku_parse_resets — declared and implemented in diku/resets.h */
 
 /* ------------------------------------------------------------------ */
 /* Graph resolution                                                   */
