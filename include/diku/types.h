@@ -69,7 +69,8 @@ struct room_t {
     int extra_desc_count;
     coord3d_t coord;
     bool coord_assigned;
-    int traversal_mark;
+    uint32_t traversal_epoch;
+    int traversal_dist;
     mobile_t **room_mobiles;
     int room_mobile_count;
     item_t **room_items;
@@ -129,14 +130,8 @@ struct area_t {
 } __attribute__((aligned(64)));
 
 /* ------------------------------------------------------------------ */
-/* Global & progress                                                  */
+/* Progress callback type                                             */
 /* ------------------------------------------------------------------ */
-typedef struct {
-    int traversal_counter;
-    int min_x, max_x, min_y, max_y, min_z, max_z;
-} diku_global_state_t;
-extern diku_global_state_t diku_global;
-
 typedef void (*diku_progress_cb_t)(const char *operation, int current, int total, const char *detail, void *user);
 
 /* ------------------------------------------------------------------ */

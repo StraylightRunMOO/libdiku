@@ -12,8 +12,6 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 /* (typedef lives in diku/types.h; this header uses it)               */
 
-void diku_set_progress_callback(diku_progress_cb_t cb, void *user);
-
 /* ------------------------------------------------------------------ */
 /* Context — carries per-operation state (replaces diku_global)       */
 /* Will be fully wired in a later migration step; declared here so    */

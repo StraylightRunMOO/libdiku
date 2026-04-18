@@ -67,11 +67,17 @@ int main(int argc, char *argv[])
     printf("Found %d .are files\n", count);
     printf("Loading until failure...\n\n");
 
+    diku_context_t *ctx = diku_context_create();
+    if (!ctx) {
+        fprintf(stderr, "Failed to create context\n");
+        return 1;
+    }
+
     int passed = 0;
     int total_rooms = 0, total_mobiles = 0, total_items = 0, total_exits = 0;
 
     for (int i = 0; i < count; i++) {
-        area_t *area = diku_parse_file(files[i]);
+        area_t *area = diku_parse_file(ctx, files[i]);
         if (!area) {
             printf("\n========================================\n");
             printf("FAILURE on file %d/%d: %s\n", i + 1, count, files[i]);
@@ -82,6 +88,9 @@ int main(int argc, char *argv[])
             printf("Total items parsed:    %d\n", total_items);
             printf("Total exits parsed:    %d\n", total_exits);
             printf("========================================\n");
+            for (int j = 0; j < count; j++) free(files[j]);
+            free(files);
+            diku_context_destroy(ctx);
             return 1;
         }
 
@@ -96,7 +105,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        diku_resolve_graph_global(area);
+        diku_resolve_graph_global(ctx, area);
 
         if ((i + 1) % 10 == 0 || i == count - 1) {
             printf("  [%d/%d] %s  ->  R:%d M:%d O:%d\n",
@@ -118,5 +127,6 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < count; i++) free(files[i]);
     free(files);
+    diku_context_destroy(ctx);
     return 0;
 }

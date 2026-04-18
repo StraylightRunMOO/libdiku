@@ -3,6 +3,7 @@
 
 #include "diku/sections.h"
 #include "diku/resets.h"
+#include "diku/context.h"
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -10,23 +11,20 @@
 extern "C" {
 #endif
 
-area_t       *diku_parse_file(const char *filename);
+area_t       *diku_parse_file(diku_context_t *ctx, const char *filename);
 area_t       *diku_parse_lexer(diku_lexer_t *lex, const char *filename);
-area_t       *diku_parse_package(const char *base_path);
+area_t       *diku_parse_package(diku_context_t *ctx, const char *base_path);
 area_t       *diku_parse_package_files(const char *wld, const char *mob, const char *obj, const char *zon);
-area_t       *diku_load_folder_are(const char *folder_path);
-area_t       *diku_load_folder_packages(const char *folder_path);
+area_t       *diku_load_folder_are(diku_context_t *ctx, const char *folder_path);
+area_t       *diku_load_folder_packages(diku_context_t *ctx, const char *folder_path);
+area_t       *diku_parse_path(diku_context_t *ctx, const char *path);
 diku_format_t diku_detect_format(const area_t *area);
 
 #ifdef DIKU_PARSER_IMPLEMENTATION
 
-/* Forward refs to globals defined in the impl TU */
-extern diku_progress_cb_t g_progress_cb;
-extern void *g_progress_user;
-
-static void diku_fmt_progress(const char *op, int cur, int total, const char *detail) {
-    if (g_progress_cb)
-        g_progress_cb(op, cur, total, detail ? detail : "", g_progress_user);
+static void diku_fmt_progress(diku_context_t *ctx, const char *op, int cur, int total, const char *detail) {
+    if (ctx && ctx->progress_cb)
+        ctx->progress_cb(op, cur, total, detail ? detail : "", ctx->progress_user);
 }
 
 static char **diku_fmt_store_raw(diku_lexer_t *lex, memento_arena_t *arena, int *line_count) {
@@ -172,14 +170,15 @@ area_t *diku_parse_lexer(diku_lexer_t *lex, const char *filename) {
     return area;
 }
 
-area_t *diku_parse_file(const char *filename) {
+area_t *diku_parse_file(diku_context_t *ctx, const char *filename) {
+    (void)ctx;
     diku_lexer_t lex;
     if (diku_lexer_init_file(&lex, filename)) {
         area_t *area = diku_parse_lexer(&lex, filename);
         diku_lexer_cleanup(&lex);
         if (area) return area;
     }
-    return diku_parse_package(filename);
+    return diku_parse_package(ctx, filename);
 }
 
 area_t *diku_parse_package_files(const char *wld, const char *mob, const char *obj, const char *zon) {
@@ -202,7 +201,8 @@ area_t *diku_parse_package_files(const char *wld, const char *mob, const char *o
     return area;
 }
 
-area_t *diku_parse_package(const char *base_path) {
+area_t *diku_parse_package(diku_context_t *ctx, const char *base_path) {
+    (void)ctx;
     size_t len = strlen(base_path);
     char *wld = (char *)malloc(len + 5);
     char *mob = (char *)malloc(len + 5);
@@ -218,7 +218,7 @@ area_t *diku_parse_package(const char *base_path) {
     return area;
 }
 
-area_t *diku_load_folder_are(const char *folder_path) {
+area_t *diku_load_folder_are(diku_context_t *ctx, const char *folder_path) {
     DIR *dir = opendir(folder_path);
     if (!dir) return NULL;
     struct dirent *entry;
@@ -235,17 +235,17 @@ area_t *diku_load_folder_are(const char *folder_path) {
         if (len <= 4 || strcasecmp(entry->d_name + len - 4, ".are") != 0) continue;
         char path[4096];
         snprintf(path, sizeof(path), "%s/%s", folder_path, entry->d_name);
-        diku_fmt_progress("parse_are", current, total, path);
-        area_t *area = diku_parse_file(path);
+        diku_fmt_progress(ctx, "parse_are", current, total, path);
+        area_t *area = diku_parse_file(ctx, path);
         if (area) { if (!head) head = tail = area; else { tail->next = area; tail = area; } }
         current++;
     }
     closedir(dir);
-    diku_fmt_progress("parse_are", total, total, "done");
+    diku_fmt_progress(ctx, "parse_are", total, total, "done");
     return head;
 }
 
-area_t *diku_load_folder_packages(const char *folder_path) {
+area_t *diku_load_folder_packages(diku_context_t *ctx, const char *folder_path) {
     DIR *dir = opendir(folder_path);
     if (!dir) return NULL;
     struct dirent *entry;
@@ -262,14 +262,25 @@ area_t *diku_load_folder_packages(const char *folder_path) {
         if (len <= 4 || strcasecmp(entry->d_name + len - 4, ".wld") != 0) continue;
         char base[4096];
         snprintf(base, sizeof(base), "%s/%.*s", folder_path, (int)(len - 4), entry->d_name);
-        diku_fmt_progress("parse_package", current, total, base);
-        area_t *area = diku_parse_package(base);
+        diku_fmt_progress(ctx, "parse_package", current, total, base);
+        area_t *area = diku_parse_package(ctx, base);
         if (area) { if (!head) head = tail = area; else { tail->next = area; tail = area; } }
         current++;
     }
     closedir(dir);
-    diku_fmt_progress("parse_package", total, total, "done");
+    diku_fmt_progress(ctx, "parse_package", total, total, "done");
     return head;
+}
+
+area_t *diku_parse_path(diku_context_t *ctx, const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return NULL;
+    if (S_ISREG(st.st_mode)) {
+        return diku_parse_file(ctx, path);
+    } else if (S_ISDIR(st.st_mode)) {
+        return diku_load_folder_are(ctx, path);
+    }
+    return NULL;
 }
 
 diku_format_t diku_detect_format(const area_t *area) {

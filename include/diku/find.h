@@ -19,6 +19,9 @@ room_t   *diku_find_room_by_name(area_t *areas, const char *keyword);
 mobile_t *diku_find_mobile_in_room_by_name(const room_t *room, const char *keyword);
 item_t   *diku_find_item_in_room_by_name(const room_t *room, const char *keyword);
 
+void      diku_free_area(area_t *area);
+void      diku_free_all_areas(area_t *areas);
+
 #ifdef DIKU_PARSER_IMPLEMENTATION
 
 void diku_build_vnum_hash(area_t *area) {
@@ -123,6 +126,22 @@ item_t *diku_find_item_in_room_by_name(const room_t *room, const char *keyword) 
             return item;
     }
     return NULL;
+}
+
+void diku_free_area(area_t *area) {
+    if (!area) return;
+    void *hash_table = area->rooms_by_vnum;
+    memento_arena_t *arena = area->arena;
+    if (hash_table) free(hash_table);
+    if (arena) diku_arena_free_all(arena);
+}
+
+void diku_free_all_areas(area_t *areas) {
+    while (areas) {
+        area_t *next = areas->next;
+        diku_free_area(areas);
+        areas = next;
+    }
 }
 
 #endif /* DIKU_PARSER_IMPLEMENTATION */
