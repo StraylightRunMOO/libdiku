@@ -1,4 +1,4 @@
-#include "diku_parser.h"
+#include "diku.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
