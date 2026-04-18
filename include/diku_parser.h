@@ -1,247 +1,23 @@
 #ifndef DIKU_PARSER_H
 #define DIKU_PARSER_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <ctype.h>
-#include <errno.h>
-#include <assert.h>
-#include <math.h>
-
-#include <memento.h>
+#include "diku/config.h"
+#include "diku/types.h"
+#include "diku/arena.h"
+#include "diku/context.h"
+#include "diku/lexer.h"
+#include "diku/util.h"
+#include "diku/find.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* ------------------------------------------------------------------ */
-/* Configuration constants                                            */
-/* ------------------------------------------------------------------ */
-#define DIKU_MAX_EXITS      12
-#define DIKU_VNUM_HASH_BITS 12
-#define DIKU_VNUM_HASH_SIZE (1 << DIKU_VNUM_HASH_BITS)
-#define DIKU_VNUM_HASH_MASK (DIKU_VNUM_HASH_SIZE - 1)
+/* Arena helpers — declared and implemented in diku/arena.h */
 
-/* Direction constants */
-#define DIR_NORTH       0
-#define DIR_EAST        1
-#define DIR_SOUTH       2
-#define DIR_WEST        3
-#define DIR_UP          4
-#define DIR_DOWN        5
-#define DIR_NORTHEAST   6
-#define DIR_NORTHWEST   7
-#define DIR_SOUTHEAST   8
-#define DIR_SOUTHWEST   9
-#define DIR_IN          10
-#define DIR_OUT         11
+/* Progress & context — declared in diku/context.h */
 
-/* Direction vector offsets for 3D coordinates */
-static const int dir_offset[12][3] = {
-    { 0,  1,  0},  /* North:      +Y */
-    { 1,  0,  0},  /* East:       +X */
-    { 0, -1,  0},  /* South:      -Y */
-    {-1,  0,  0},  /* West:       -X */
-    { 0,  0,  1},  /* Up:         +Z */
-    { 0,  0, -1},  /* Down:       -Z */
-    { 1,  1,  0},  /* Northeast:  +X +Y */
-    {-1,  1,  0},  /* Northwest:  -X +Y */
-    { 1, -1,  0},  /* Southeast:  +X -Y */
-    {-1, -1,  0},  /* Southwest:  -X -Y */
-    { 0,  0,  0},  /* In:          0  0 */
-    { 0,  0,  0},  /* Out:         0  0 */
-};
-
-/* ------------------------------------------------------------------ */
-/* Forward declarations                                               */
-/* ------------------------------------------------------------------ */
-typedef struct diku_string_t diku_string_t;
-typedef struct exit_t exit_t;
-typedef struct room_t room_t;
-typedef struct mobile_t mobile_t;
-typedef struct item_t item_t;
-typedef struct area_t area_t;
-typedef struct coord3d_t coord3d_t;
-typedef struct vnum_hash_entry_t vnum_hash_entry_t;
-typedef struct diku_lexer_t diku_lexer_t;
-
-/* ------------------------------------------------------------------ */
-/* String & coordinate types                                          */
-/* ------------------------------------------------------------------ */
-struct diku_string_t {
-    char *str;
-    size_t len;
-};
-
-struct coord3d_t {
-    int x, y, z;
-};
-
-/* ------------------------------------------------------------------ */
-/* Core structs — C99 + __attribute__((aligned(64))) for hot paths   */
-/* ------------------------------------------------------------------ */
-struct exit_t {
-    int direction;
-    diku_string_t desc;
-    diku_string_t keywords;
-    int flags;
-    int key_vnum;
-    int to_vnum;
-    room_t *to_room;
-    exit_t *next;
-};
-
-/* Forward typedef + aligned struct definition (C99 legal) */
-typedef struct room_t room_t;
-struct room_t {
-    int vnum;
-    diku_string_t name;
-    diku_string_t desc;
-    int flags;
-    int sector;
-    exit_t *exits[DIKU_MAX_EXITS];
-    struct { diku_string_t keywords; diku_string_t desc; } *extra_descs;
-    int extra_desc_count;
-    coord3d_t coord;
-    bool coord_assigned;
-    int traversal_mark;
-    mobile_t **room_mobiles;
-    int room_mobile_count;
-    item_t **room_items;
-    int room_item_count;
-    void *user;
-} __attribute__((aligned(64)));
-
-typedef struct mobile_t mobile_t;
-struct mobile_t {
-    int vnum;
-    diku_string_t name, short_desc, long_desc, description;
-    int level, alignment, sex, race;
-    uint32_t act_flags, aff_flags, off_flags, imm_flags, res_flags, vuln_flags;
-    int hitroll, damroll;
-    int ac[4], hit[3], mana[3], damage[3];
-    int start_pos, default_pos;
-    long gold, silver;
-    int form, parts, size;
-    diku_string_t material;
-    char **extra_lines; int extra_count;
-    struct { item_t *item; int wear_loc; } *inventory;
-    int inventory_count;
-    void *user;
-} __attribute__((aligned(64)));
-
-typedef struct item_t item_t;
-struct item_t {
-    int vnum;
-    diku_string_t name, short_desc, long_desc, description;
-    int type, value[5], weight, cost, level;
-    uint32_t extra_flags, wear_flags;
-    diku_string_t material;
-    struct { int location; int modifier; } *affects;
-    int affect_count;
-    struct { diku_string_t keywords; diku_string_t desc; } *extra_descs;
-    int extra_desc_count;
-    char **extra_lines; int extra_count;
-    void *user;
-} __attribute__((aligned(64)));
-
-typedef struct area_t area_t;
-struct area_t {
-    diku_string_t name, filename, builders, credits;
-    int low_level, high_level, low_vnum, high_vnum;
-    int security, version, reset_interval;
-    diku_string_t ambient_sound, owner, reset_msg, weather, pay_info, teleport_info, magic_info;
-    room_t *rooms; int room_count;
-    room_t **rooms_by_vnum;
-    mobile_t *mobiles; int mobile_count;
-    item_t *items; int item_count;
-    char **helps_raw, **resets_raw, **shops_raw, **specials_raw, **objfuns_raw;
-    int helps_line_count, resets_line_count, shops_line_count, specials_line_count, objfuns_line_count;
-    struct { diku_string_t section_name; char **lines; int line_count; } *extra_sections;
-    int extra_section_count;
-    memento_arena_t *arena;
-    area_t *next;
-} __attribute__((aligned(64)));
-
-/* ------------------------------------------------------------------ */
-/* Global & progress                                                  */
-/* ------------------------------------------------------------------ */
-typedef struct {
-    int traversal_counter;
-    int min_x, max_x, min_y, max_y, min_z, max_z;
-} diku_global_state_t;
-extern diku_global_state_t diku_global;
-
-typedef void (*diku_progress_cb_t)(const char *operation, int current, int total, const char *detail, void *user);
-void diku_set_progress_callback(diku_progress_cb_t cb, void *user);
-
-/* ------------------------------------------------------------------ */
-/* Lexer types                                                        */
-/* ------------------------------------------------------------------ */
-typedef enum {
-    TOK_EOF,
-    TOK_HASH_SECTION,   /* #ROOMS, #MOBILES, etc. */
-    TOK_NUMBER,
-    TOK_STRING,         /* ~ terminated, trimmed */
-    TOK_WORD,           /* single word for flags, etc. */
-    TOK_EOL,
-    TOK_UNKNOWN
-} diku_token_type_t;
-
-typedef struct {
-    const char *start;      /* pointer into file buffer */
-    size_t      len;
-    diku_token_type_t type;
-    int         line;
-    int         col;
-} diku_token_t;
-
-struct diku_lexer_t {
-    memento_arena_t *arena;
-    const char *buf;        /* entire file, arena-backed or malloc'd */
-    const char *pos;
-    const char *end;
-    int         line;
-    int         col;
-    bool        owns_buf;   /* true if buf was malloc'd */
-};
-
-/* ------------------------------------------------------------------ */
-/* Arena helpers (thin wrappers over memento)                         */
-/* ------------------------------------------------------------------ */
-memento_arena_t *diku_arena_create(void);
-void *diku_arena_alloc(memento_arena_t *a, size_t n);
-void *diku_arena_alloc_aligned(memento_arena_t *a, size_t n, size_t align);
-char *diku_arena_strdup(memento_arena_t *a, const char *s);
-diku_string_t diku_arena_strndup(memento_arena_t *a, const char *s, size_t len);
-diku_string_t diku_arena_strdup_diku(memento_arena_t *a, const char *s);
-void diku_arena_free_all(memento_arena_t *a);
-
-/* ------------------------------------------------------------------ */
-/* Lexer API                                                          */
-/* ------------------------------------------------------------------ */
-bool diku_lexer_init_file(diku_lexer_t *lex, const char *filename);
-bool diku_lexer_init_fp(diku_lexer_t *lex, FILE *fp);
-void diku_lexer_init_buf(diku_lexer_t *lex, const char *buf, size_t len);
-void diku_lexer_cleanup(diku_lexer_t *lex);
-
-diku_token_t diku_lexer_next(diku_lexer_t *lex);
-int diku_lexer_getc(diku_lexer_t *lex);
-void diku_lexer_ungetc(diku_lexer_t *lex, int c);
-long diku_lexer_tell(diku_lexer_t *lex);
-void diku_lexer_seek(diku_lexer_t *lex, long pos);
-int diku_lexer_peek(diku_lexer_t *lex);
-void diku_lexer_skip_ws(diku_lexer_t *lex);
-void diku_lexer_skip_line(diku_lexer_t *lex);
-bool diku_lexer_read_word(diku_lexer_t *lex, char *out, size_t max);
-bool diku_lexer_read_line(diku_lexer_t *lex, char *out, size_t max);
-int diku_lexer_read_number(diku_lexer_t *lex, int *out);
-diku_string_t diku_lexer_read_string(diku_lexer_t *lex, memento_arena_t *arena);
-char *diku_lexer_read_word_dup(diku_lexer_t *lex, memento_arena_t *arena);
-bool diku_lexer_eof(diku_lexer_t *lex);
+/* Lexer API — declared and implemented in diku/lexer.h */
 
 /* ------------------------------------------------------------------ */
 /* Section parsers & main entry points                                */
@@ -264,14 +40,11 @@ area_t *diku_load_folder_packages(const char *folder_path);
 void diku_parse_resets(area_t *area);
 
 /* ------------------------------------------------------------------ */
-/* Graph resolution & lookups                                         */
+/* Graph resolution                                                   */
 /* ------------------------------------------------------------------ */
 void diku_resolve_graph(area_t **areas, int area_count);
 void diku_resolve_graph_global(area_t *areas);
-room_t *diku_find_room(area_t *area, int vnum);
-room_t *diku_find_room_global(area_t *areas, int vnum);
-mobile_t *diku_find_mobile(area_t *area, int vnum);
-item_t *diku_find_item(area_t *area, int vnum);
+/* diku_find_room*, diku_find_mobile, diku_find_item — in diku/find.h */
 
 /* ------------------------------------------------------------------ */
 /* Coordinate assignment                                              */
@@ -296,12 +69,9 @@ void diku_print_mobile(const mobile_t *mob);
 void diku_print_item(const item_t *item);
 void diku_print_graph(const area_t *area);
 void diku_print_coordinates(area_t *area);
-const char *diku_dir_name(int dir);
-const char *diku_dir_name_short(int dir);
-int diku_reverse_dir(int dir);
-bool diku_has_exit(const room_t *room, int dir);
-int diku_get_exit_vnum(const room_t *room, int dir);
-int diku_count_exits(const room_t *room);
+/* diku_dir_name, diku_dir_name_short, diku_reverse_dir, diku_has_exit,
+   diku_get_exit_vnum, diku_count_exits, diku_sector_name, diku_item_type_name,
+   diku_format_name — defined as static inline in diku/util.h */
 int diku_graph_diameter(area_t *area);
 int diku_check_exit_symmetry(const area_t *area, int *out_total, int *out_asymmetric);
 void diku_print_exit_symmetry(const area_t *area);
@@ -309,22 +79,10 @@ void diku_print_exit_symmetry(const area_t *area);
 /* ------------------------------------------------------------------ */
 /* Fork detection                                                     */
 /* ------------------------------------------------------------------ */
-typedef enum {
-    DIKU_FMT_UNKNOWN = 0,
-    DIKU_FMT_DIKU,
-    DIKU_FMT_MERC,
-    DIKU_FMT_ROM,
-    DIKU_FMT_CIRCLE,
-    DIKU_FMT_SMAUG,
-    DIKU_FMT_CUSTOM
-} diku_format_t;
-
 diku_format_t diku_detect_format(const area_t *area);
-const char *diku_format_name(diku_format_t fmt);
-const char *diku_sector_name(int sector);
-const char *diku_item_type_name(int type);
+/* diku_format_name, diku_sector_name, diku_item_type_name — in diku/util.h */
 
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif /* DIKU_PARSER_H */

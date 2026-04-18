@@ -1,0 +1,83 @@
+ROOM #6000 The edge of the forest
+ROOM #6001 A trail through the light forest
+ROOM #6002 A trail through the light forest
+ROOM #6003 A trail through the dense forest
+ROOM #6004 A trail through the dense forest
+ROOM #6005 A small path in the dense forest
+ROOM #6006 A small path in the dense forest
+ROOM #6007 An intersection in the dense forest
+ROOM #6008 The forest clearing
+ROOM #6009 Outside a small cabin in the forest
+ROOM #6010 Inside the cabin
+ROOM #6011 A small path through the light forest
+ROOM #6012 An intersection in the dense forest
+ROOM #6013 A small path in the dense forest
+ROOM #6014 An intersection in the dense forest
+ROOM #6015 A small path in the dense forest
+ROOM #6016 A small path in the dense forest
+ROOM #6017 A small path in the dense forest
+ROOM #6018 An intersection in the light forest
+ROOM #6019 A small path in the dense forest
+ROOM #6020 A small path in the dense forest
+ROOM #6021 A small path in the dense forest
+ROOM #6022 Inside the cave
+ROOM #6023 On a small, grassy field
+ROOM #6100 A narrow trail through the deep, dark forest
+ROOM #6101 A narrow trail through the deep, dark forest
+ROOM #6102 A narrow trail through the deep, dark forest
+ROOM #6103 A narrow trail through the deep, dark forest
+ROOM #6104 A small path in the deep, dark forest
+ROOM #6105 A small path in the deep, dark forest
+ROOM #6106 A junction in the deep, dark forest
+ROOM #6107 A small path in the deep, dark forest
+ROOM #6108 A narrow trail through the deep, dark forest
+ROOM #6109 A narrow trail through the deep, dark forest
+ROOM #6110 A narrow trail through the deep, dark forest
+ROOM #6111 A narrow trail through the deep, dark forest
+ROOM #6112 A narrow trail through the deep, dark forest
+ROOM #6113 A small path in the deep, dark forest
+ROOM #6114 A junction in the deep, dark forest
+ROOM #6115 A small path in the deep, dark forest
+ROOM #6116 A small path in the deep, dark forest
+ROOM #6117 A junction in the deep, dark forest
+ROOM #6118 A small path in the deep, dark forest
+ROOM #6119 A small path in the deep, dark forest
+ROOM #6120 On the river bank in the deep, dark forest
+ROOM #6121 A dead end path on the river bank in the deep, dark forest
+ROOM #6122 A small path in the deep, dark forest
+ROOM #6123 A junction on the river bank in the deep, dark forest
+ROOM #6124 A dead end path in the deep, dark forest
+ROOM #6125 A small path on the river bank in the deep, dark forest
+ROOM #6126 A narrow trail through the deep, dark forest
+ROOM #6127 A narrow trail through the deep, dark forest
+ROOM #6128 A narrow trail through the deep, dark forest
+ROOM #6129 A narrow trail through the deep, dark forest
+ROOM #6130 A narrow trail through the deep, dark forest
+ROOM #6131 The spider web
+ROOM #6132 Up in the tree
+ROOM #6133 On the spider web
+ROOM #6134 The Den of the Queen Spider
+ROOM #6135 A dusty trail in the deep, dark forest
+ROOM #6136 A dusty trail in the deep, dark forest
+ROOM #6137 At the end of the trail through the deep, dark forest
+ROOM #6142 Outside a cave in the deep, dark forest
+ROOM #6143 The cave of the Green Dragon
+ROOM #6144 A small path in the deep, dark forest
+ROOM #6150 The narrow trail.
+ROOM #6151 The narrow trail.
+ROOM #6152 The circle of trees.
+ROOM #6153 Inside the great tree.
+ROOM #6154 The underground hallway.
+ROOM #6155 The cultist temple.
+============================================================
+Source: data/haon.are
+Areas loaded: 1
+============================================================
+Total Rooms:    71
+Total Mobiles:  12
+Total Objects:  21
+Total Exits:    158 (95.6% resolved)
+Symmetry:       1/151 asymmetric exits
+============================================================
+  haon.are                        R:  71  M:  12  O:  21
+============================================================

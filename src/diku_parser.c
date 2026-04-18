@@ -1,4 +1,5 @@
 #define MEMENTO_IMPLEMENTATION
+#define DIKU_PARSER_IMPLEMENTATION
 #include "diku_parser.h"
 #include <limits.h>
 #include <dirent.h>
@@ -27,376 +28,9 @@ static void report_progress(const char *op, int cur, int total, const char *deta
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Lexer and arena wrappers                                           */
-/* ------------------------------------------------------------------ */
+/* Arena wrappers — implemented via DIKU_PARSER_IMPLEMENTATION in diku/arena.h */
 
-memento_arena_t *diku_arena_create(void) {
-    static bool memento_initialized = false;
-    if (!memento_initialized) {
-        memento_init();
-        memento_initialized = true;
-    }
-    memento_thread_heap_t *heap = memento_thread_heap_get();
-    return memento_arena_create(4 * 1024 * 1024, heap);
-}
-
-void *diku_arena_alloc(memento_arena_t *a, size_t n) {
-    if (!a || n == 0) return NULL;
-    return memento_arena_alloc(a, n, 8);
-}
-
-void *diku_arena_alloc_aligned(memento_arena_t *a, size_t n, size_t align) {
-    if (!a || n == 0) return NULL;
-    return memento_arena_alloc(a, n, align);
-}
-
-char *diku_arena_strdup(memento_arena_t *a, const char *s) {
-    if (!s) return NULL;
-    size_t len = strlen(s);
-    char *copy = (char *)diku_arena_alloc(a, len + 1);
-    if (!copy) return NULL;
-    memcpy(copy, s, len + 1);
-    return copy;
-}
-
-diku_string_t diku_arena_strndup(memento_arena_t *a, const char *s, size_t len) {
-    diku_string_t result = {NULL, 0};
-    if (!s) return result;
-    result.str = (char *)diku_arena_alloc(a, len + 1);
-    if (!result.str) return result;
-    memcpy(result.str, s, len);
-    result.str[len] = '\0';
-    result.len = len;
-    return result;
-}
-
-diku_string_t diku_arena_strdup_diku(memento_arena_t *a, const char *s) {
-    diku_string_t result = {NULL, 0};
-    if (!s) return result;
-    const char *end = strchr(s, '~');
-    if (!end) end = s + strlen(s);
-    size_t len = end - s;
-    while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r' || s[len-1] == ' ' || s[len-1] == '\t'))
-        len--;
-    result.str = (char *)diku_arena_alloc(a, len + 1);
-    if (!result.str) return result;
-    memcpy(result.str, s, len);
-    result.str[len] = '\0';
-    result.len = len;
-    return result;
-}
-
-void diku_arena_free_all(memento_arena_t *a) {
-    if (a) memento_arena_destroy(a);
-}
-
-/* ------------------------------------------------------------------ */
-/* Lexer implementation                                               */
-/* ------------------------------------------------------------------ */
-
-bool diku_lexer_init_file(diku_lexer_t *lex, const char *filename) {
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) return false;
-    bool ok = diku_lexer_init_fp(lex, fp);
-    fclose(fp);
-    return ok;
-}
-
-bool diku_lexer_init_fp(diku_lexer_t *lex, FILE *fp) {
-    if (!fp || fseek(fp, 0, SEEK_END) != 0) return false;
-    long size = ftell(fp);
-    if (size < 0) return false;
-    rewind(fp);
-    char *buf = (char *)malloc(size + 1);
-    if (!buf) return false;
-    size_t read = fread(buf, 1, size, fp);
-    buf[read] = '\0';
-    diku_lexer_init_buf(lex, buf, read);
-    lex->owns_buf = true;
-    return true;
-}
-
-void diku_lexer_init_buf(diku_lexer_t *lex, const char *buf, size_t len) {
-    memset(lex, 0, sizeof(*lex));
-    lex->buf = buf;
-    lex->pos = buf;
-    lex->end = buf + len;
-    lex->line = 1;
-    lex->col = 1;
-    lex->owns_buf = false;
-}
-
-void diku_lexer_cleanup(diku_lexer_t *lex) {
-    if (lex && lex->owns_buf) {
-        free((void *)lex->buf);
-        lex->buf = NULL;
-        lex->pos = NULL;
-        lex->end = NULL;
-        lex->owns_buf = false;
-    }
-}
-
-diku_token_t diku_lexer_next(diku_lexer_t *lex) {
-    diku_token_t tok = {NULL, 0, TOK_EOF, lex->line, lex->col};
-
-    while (lex->pos < lex->end) {
-        char c = *lex->pos;
-        if (c == '\n') { lex->line++; lex->col = 1; lex->pos++; }
-        else if (c == '\r') { lex->pos++; }
-        else if (c == '*') {
-            while (lex->pos < lex->end && *lex->pos != '\n') lex->pos++;
-            continue;
-        }
-        else if (isspace((unsigned char)c)) { lex->pos++; lex->col++; }
-        else break;
-    }
-
-    if (lex->pos >= lex->end) return tok;
-
-    const char *start = lex->pos;
-    char c = *lex->pos++;
-    int start_col = lex->col++;
-
-    if (c == '#') {
-        tok.type = TOK_HASH_SECTION;
-        while (lex->pos < lex->end && !isspace((unsigned char)*lex->pos) && *lex->pos != '\n' && *lex->pos != '\r')
-            lex->pos++;
-        tok.start = start;
-        tok.len = (size_t)(lex->pos - start);
-        tok.line = lex->line;
-        tok.col = start_col;
-        return tok;
-    }
-
-    if (isdigit((unsigned char)c) || c == '-' || c == '+') {
-        tok.type = TOK_NUMBER;
-        while (lex->pos < lex->end && isdigit((unsigned char)*lex->pos)) { lex->pos++; lex->col++; }
-        tok.start = start;
-        tok.len = (size_t)(lex->pos - start);
-        tok.line = lex->line;
-        tok.col = start_col;
-        return tok;
-    }
-
-    if (c == '~') {
-        tok.type = TOK_STRING;
-        tok.start = lex->pos;
-        tok.len = 0;
-        tok.line = lex->line;
-        tok.col = start_col;
-        return tok;
-    }
-
-    const char *tilde = memchr(lex->pos - 1, '~', (size_t)(lex->end - (lex->pos - 1)));
-    if (tilde) {
-        tok.type = TOK_STRING;
-        tok.start = start + 1;
-        tok.len = (size_t)(tilde - start - 1);
-        while (tok.len > 0 && (tok.start[tok.len-1] == '\n' || tok.start[tok.len-1] == '\r' ||
-                               tok.start[tok.len-1] == ' ' || tok.start[tok.len-1] == '\t'))
-            tok.len--;
-        lex->pos = tilde + 1;
-        lex->col += (int)(lex->pos - start);
-        tok.line = lex->line;
-        tok.col = start_col;
-        return tok;
-    }
-
-    tok.type = TOK_WORD;
-    while (lex->pos < lex->end && !isspace((unsigned char)*lex->pos) && *lex->pos != '#' && *lex->pos != '~') {
-        lex->pos++;
-        lex->col++;
-    }
-    tok.start = start;
-    tok.len = (size_t)(lex->pos - start);
-    tok.line = lex->line;
-    tok.col = start_col;
-    return tok;
-}
-
-int diku_lexer_getc(diku_lexer_t *lex) {
-    if (lex->pos >= lex->end) return EOF;
-    char c = *lex->pos++;
-    if (c == '\n') { lex->line++; lex->col = 1; }
-    else { lex->col++; }
-    return (unsigned char)c;
-}
-
-void diku_lexer_ungetc(diku_lexer_t *lex, int c) {
-    (void)c;
-    if (lex->pos <= lex->buf) return;
-    lex->pos--;
-    if (*lex->pos == '\n') {
-        lex->line--;
-        lex->col = 1;
-        const char *p = lex->pos - 1;
-        while (p >= lex->buf && *p != '\n') { lex->col++; p--; }
-    } else {
-        lex->col--;
-    }
-}
-
-long diku_lexer_tell(diku_lexer_t *lex) {
-    return (long)(lex->pos - lex->buf);
-}
-
-void diku_lexer_seek(diku_lexer_t *lex, long pos) {
-    if (pos < 0) pos = 0;
-    if (pos > (long)(lex->end - lex->buf)) pos = (long)(lex->end - lex->buf);
-    lex->pos = lex->buf + pos;
-    /* Recalculate line/col from start - slow but correct */
-    lex->line = 1;
-    lex->col = 1;
-    for (const char *p = lex->buf; p < lex->pos; p++) {
-        if (*p == '\n') { lex->line++; lex->col = 1; }
-        else if (*p != '\r') { lex->col++; }
-    }
-}
-
-int diku_lexer_peek(diku_lexer_t *lex) {
-    if (lex->pos >= lex->end) return EOF;
-    return (unsigned char)*lex->pos;
-}
-
-void diku_lexer_skip_ws(diku_lexer_t *lex) {
-    while (lex->pos < lex->end) {
-        char c = *lex->pos;
-        if (c == '\n') { lex->line++; lex->col = 1; lex->pos++; }
-        else if (c == '\r') { lex->pos++; }
-        else if (c == '*') {
-            while (lex->pos < lex->end && *lex->pos != '\n') lex->pos++;
-        }
-        else if (isspace((unsigned char)c)) { lex->pos++; lex->col++; }
-        else break;
-    }
-}
-
-void diku_lexer_skip_line(diku_lexer_t *lex) {
-    while (lex->pos < lex->end && *lex->pos != '\n') lex->pos++;
-    if (lex->pos < lex->end && *lex->pos == '\n') { lex->pos++; lex->line++; lex->col = 1; }
-}
-
-bool diku_lexer_read_word(diku_lexer_t *lex, char *out, size_t max) {
-    diku_lexer_skip_ws(lex);
-    if (lex->pos >= lex->end) return false;
-    size_t len = 0;
-    while (lex->pos < lex->end && !isspace((unsigned char)*lex->pos)) {
-        if (len + 1 < max) out[len] = *lex->pos;
-        len++;
-        lex->pos++;
-        lex->col++;
-    }
-    if (len == 0) return false;
-    out[len < max ? len : max - 1] = '\0';
-    return true;
-}
-
-bool diku_lexer_read_line(diku_lexer_t *lex, char *out, size_t max) {
-    if (lex->pos >= lex->end) return false;
-    size_t len = 0;
-    while (lex->pos < lex->end && *lex->pos != '\n' && *lex->pos != '\r') {
-        if (len + 1 < max) out[len] = *lex->pos;
-        len++;
-        lex->pos++;
-        lex->col++;
-    }
-    if (lex->pos < lex->end && (*lex->pos == '\n' || *lex->pos == '\r')) {
-        if (*lex->pos == '\r') lex->pos++;
-        if (lex->pos < lex->end && *lex->pos == '\n') lex->pos++;
-        lex->line++;
-        lex->col = 1;
-    }
-    out[len < max ? len : max - 1] = '\0';
-    return true;
-}
-
-int diku_lexer_read_number(diku_lexer_t *lex, int *out) {
-    diku_lexer_skip_ws(lex);
-    if (lex->pos >= lex->end) return -1;
-
-    const char *start = lex->pos;
-    bool negative = false;
-    if (*lex->pos == '-') { negative = true; lex->pos++; lex->col++; }
-    else if (*lex->pos == '+') { lex->pos++; lex->col++; }
-
-    if (lex->pos >= lex->end || !isdigit((unsigned char)*lex->pos)) {
-        lex->pos = start;
-        return -1;
-    }
-
-    long num = 0;
-    while (lex->pos < lex->end && isdigit((unsigned char)*lex->pos)) {
-        num = num * 10 + (*lex->pos - '0');
-        lex->pos++;
-        lex->col++;
-    }
-
-    *out = negative ? -(int)num : (int)num;
-    return 0;
-}
-
-diku_string_t diku_lexer_read_string(diku_lexer_t *lex, memento_arena_t *arena) {
-    diku_lexer_skip_ws(lex);
-    diku_string_t result = {NULL, 0};
-    if (lex->pos >= lex->end) return result;
-
-    if (*lex->pos == '~') {
-        lex->pos++;
-        lex->col++;
-        return result;
-    }
-
-    const char *start = lex->pos;
-    const char *tilde = memchr(lex->pos, '~', (size_t)(lex->end - lex->pos));
-    if (!tilde) tilde = lex->end;
-
-    size_t len = (size_t)(tilde - start);
-    while (len > 0 && (start[len-1] == '\n' || start[len-1] == '\r' || start[len-1] == ' ' || start[len-1] == '\t'))
-        len--;
-
-    result = diku_arena_strndup(arena, start, len);
-    lex->pos = tilde + 1;
-    lex->col += (int)(tilde - start + 1);
-    return result;
-}
-
-char *diku_lexer_read_word_dup(diku_lexer_t *lex, memento_arena_t *arena) {
-    char buf[256];
-    if (!diku_lexer_read_word(lex, buf, sizeof(buf))) return NULL;
-    return diku_arena_strdup(arena, buf);
-}
-
-static char *diku_lexer_read_line_dup(diku_lexer_t *lex, memento_arena_t *arena) {
-    char buf[4096];
-    if (!diku_lexer_read_line(lex, buf, sizeof(buf))) return NULL;
-    return diku_arena_strdup(arena, buf);
-}
-
-bool diku_lexer_eof(diku_lexer_t *lex) {
-    diku_lexer_skip_ws(lex);
-    return lex->pos >= lex->end;
-}
-
-static diku_string_t diku_lexer_read_string_eol(diku_lexer_t *lex, memento_arena_t *arena) {
-    diku_string_t result = {NULL, 0};
-    char buf[4096];
-    if (!diku_lexer_read_line(lex, buf, sizeof(buf))) return result;
-    result.str = diku_arena_strdup(arena, buf);
-    result.len = result.str ? strlen(result.str) : 0;
-    return result;
-}
-
-static bool diku_lexer_read_letter(diku_lexer_t *lex, char expected) {
-    diku_lexer_skip_ws(lex);
-    if (lex->pos >= lex->end) return false;
-    if (*lex->pos == expected) {
-        lex->pos++;
-        lex->col++;
-        return true;
-    }
-    return false;
-}
+/* Lexer — implemented via DIKU_PARSER_IMPLEMENTATION in diku/lexer.h */
 
 /* Area header parser                                                 */
 /* ------------------------------------------------------------------ */
@@ -1376,17 +1010,7 @@ area_t *diku_parse_package_files(const char *wld, const char *mob, const char *o
         return NULL;
     }
     
-    /* Build vnum hash table */
-    if (area->room_count > 0) {
-        area->rooms_by_vnum = (room_t **)calloc(DIKU_VNUM_HASH_SIZE, sizeof(room_t *));
-        for (int i = 0; i < area->room_count; i++) {
-            int hash = area->rooms[i].vnum & DIKU_VNUM_HASH_MASK;
-            if (!area->rooms_by_vnum[hash]) {
-                area->rooms_by_vnum[hash] = &area->rooms[i];
-            }
-        }
-    }
-    
+    diku_build_vnum_hash(area);
     return area;
 }
 
@@ -1742,18 +1366,8 @@ area_t *diku_parse_lexer(diku_lexer_t *lex, const char *filename) {
         }
     }
     
-    /* Build vnum hash table for fast room lookup */
-    if (area->room_count > 0) {
-        area->rooms_by_vnum = (room_t **)calloc(DIKU_VNUM_HASH_SIZE, sizeof(room_t *));
-        for (int i = 0; i < area->room_count; i++) {
-            int hash = area->rooms[i].vnum & DIKU_VNUM_HASH_MASK;
-            /* Simple chaining - store first room at hash, link others */
-            if (!area->rooms_by_vnum[hash]) {
-                area->rooms_by_vnum[hash] = &area->rooms[i];
-            }
-        }
-    }
-    
+    diku_build_vnum_hash(area);
+
     /* Parse resets into room contents */
     diku_parse_resets(area);
     
@@ -1902,18 +1516,7 @@ area_t *diku_parse_file(const char *filename) {
 /* Graph resolution - link exits to rooms                             */
 /* ------------------------------------------------------------------ */
 
-room_t *diku_find_room(area_t *area, int vnum) {
-    if (!area) return NULL;
-    
-    /* Linear search through rooms */
-    for (int i = 0; i < area->room_count; i++) {
-        if (area->rooms[i].vnum == vnum) {
-            return &area->rooms[i];
-        }
-    }
-    
-    return NULL;
-}
+/* diku_find_room — implemented via DIKU_PARSER_IMPLEMENTATION in diku/find.h */
 
 void diku_resolve_graph(area_t **areas, int area_count) {
     /* Build global room lookup */
@@ -2427,37 +2030,7 @@ void diku_get_coord_bounds(area_t *area, int *min_x, int *max_x,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Lookup functions                                                   */
-/* ------------------------------------------------------------------ */
-
-mobile_t *diku_find_mobile(area_t *area, int vnum) {
-    if (!area) return NULL;
-    for (int i = 0; i < area->mobile_count; i++) {
-        if (area->mobiles[i].vnum == vnum) {
-            return &area->mobiles[i];
-        }
-    }
-    return NULL;
-}
-
-item_t *diku_find_item(area_t *area, int vnum) {
-    if (!area) return NULL;
-    for (int i = 0; i < area->item_count; i++) {
-        if (area->items[i].vnum == vnum) {
-            return &area->items[i];
-        }
-    }
-    return NULL;
-}
-
-room_t *diku_find_room_global(area_t *areas, int vnum) {
-    for (area_t *area = areas; area; area = area->next) {
-        room_t *room = diku_find_room(area, vnum);
-        if (room) return room;
-    }
-    return NULL;
-}
+/* diku_find_mobile, diku_find_item, diku_find_room_global — in diku/find.h */
 
 /* ------------------------------------------------------------------ */
 /* Cleanup functions                                                  */
@@ -2489,59 +2062,8 @@ void diku_free_all_areas(area_t *areas) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Utility functions                                                  */
-/* ------------------------------------------------------------------ */
-
-const char *diku_dir_name(int dir) {
-    static const char *names[] = {
-        "north", "east", "south", "west", "up", "down",
-        "northeast", "northwest", "southeast", "southwest",
-        "in", "out"
-    };
-    if (dir < 0 || dir >= DIKU_MAX_EXITS) return "unknown";
-    return names[dir];
-}
-
-const char *diku_dir_name_short(int dir) {
-    static const char *names[] = {
-        "n", "e", "s", "w", "u", "d",
-        "ne", "nw", "se", "sw", "in", "out"
-    };
-    if (dir < 0 || dir >= DIKU_MAX_EXITS) return "?";
-    return names[dir];
-}
-
-int diku_reverse_dir(int dir) {
-    static const int reverse[] = {
-        DIR_SOUTH, DIR_WEST, DIR_NORTH, DIR_EAST, DIR_DOWN, DIR_UP,
-        DIR_SOUTHWEST, DIR_SOUTHEAST, DIR_NORTHWEST, DIR_NORTHEAST,
-        DIR_OUT, DIR_IN
-    };
-    if (dir < 0 || dir >= DIKU_MAX_EXITS) return -1;
-    return reverse[dir];
-}
-
-bool diku_has_exit(const room_t *room, int dir) {
-    if (!room || dir < 0 || dir >= DIKU_MAX_EXITS) return false;
-    return room->exits[dir] != NULL && room->exits[dir]->to_vnum > 0;
-}
-
-int diku_get_exit_vnum(const room_t *room, int dir) {
-    if (!diku_has_exit(room, dir)) return -1;
-    return room->exits[dir]->to_vnum;
-}
-
-int diku_count_exits(const room_t *room) {
-    if (!room) return 0;
-    int count = 0;
-    for (int i = 0; i < DIKU_MAX_EXITS; i++) {
-        if (room->exits[i] && room->exits[i]->to_vnum > 0) {
-            count++;
-        }
-    }
-    return count;
-}
+/* diku_dir_name*, diku_reverse_dir, diku_has_exit, diku_get_exit_vnum,
+   diku_count_exits — moved to static inline in diku/util.h */
 
 /* ------------------------------------------------------------------ */
 /* Exit symmetry check                                                */
@@ -2789,33 +2311,7 @@ void diku_print_coordinates(area_t *area) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Format detection and names                                         */
-/* ------------------------------------------------------------------ */
-
-const char *diku_sector_name(int sector) {
-    static const char *names[] = {
-        "inside", "city", "field", "forest", "hills", "mountain",
-        "water_swim", "water_noswim", "underwater", "air", "desert",
-        "unknown", "unknown", "unknown", "unknown", "unknown"
-    };
-    if (sector < 0 || sector >= 16) return "unknown";
-    return names[sector];
-}
-
-const char *diku_item_type_name(int type) {
-    static const char *names[] = {
-        "none", "light", "scroll", "wand", "staff", "weapon",
-        "unused", "unused", "treasure", "armor", "potion",
-        "unused", "furniture", "trash", "unused", "container",
-        "unused", "drink", "key", "food", "money", "unused",
-        "boat", "corpse_npc", "corpse_pc", "fountain", "pill",
-        "protect", "map", "portal", "warp_stone", "room_key",
-        "gem", "jewelry", "jitbag"
-    };
-    if (type < 0 || type >= 35) return "unknown";
-    return names[type];
-}
+/* diku_sector_name, diku_item_type_name — moved to static inline in diku/util.h */
 
 diku_format_t diku_detect_format(const area_t *area) {
     if (!area) return DIKU_FMT_UNKNOWN;
@@ -2847,17 +2343,7 @@ diku_format_t diku_detect_format(const area_t *area) {
     return DIKU_FMT_DIKU;
 }
 
-const char *diku_format_name(diku_format_t fmt) {
-    switch (fmt) {
-        case DIKU_FMT_DIKU:    return "DikuMUD";
-        case DIKU_FMT_MERC:    return "Merc";
-        case DIKU_FMT_ROM:     return "ROM";
-        case DIKU_FMT_CIRCLE:  return "CircleMUD";
-        case DIKU_FMT_SMAUG:   return "SMAUG";
-        case DIKU_FMT_CUSTOM:  return "Custom";
-        default:               return "Unknown";
-    }
-}
+/* diku_format_name — moved to static inline in diku/util.h */
 
 /* ------------------------------------------------------------------ */
 /* Graph diameter calculation (for analysis)                          */
