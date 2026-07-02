@@ -44,12 +44,22 @@ static void collect_are_files(const char *base_path, char ***files, int *count)
 
 int main(int argc, char *argv[])
 {
+    bool verbose = false;
     const char *folders[2] = {"./data", "./data2"};
     int folder_count = 2;
-    if (argc > 1) {
-        folders[0] = argv[1];
-        folder_count = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            verbose = true;
+        } else {
+            folders[0] = argv[i];
+            folder_count = 1;
+        }
     }
+
+#ifdef DIKU_VERBOSE
+    verbose = true;
+#endif
 
     char **files = NULL;
     int count = 0;
@@ -64,8 +74,10 @@ int main(int argc, char *argv[])
 
     qsort(files, count, sizeof(char *), compare_strings);
 
-    printf("Found %d .are files\n", count);
-    printf("Loading until failure...\n\n");
+    if (verbose) {
+        printf("Found %d .are files\n", count);
+        printf("Loading until failure...\n\n");
+    }
 
     diku_context_t *ctx = diku_context_create();
     if (!ctx) {
@@ -107,7 +119,7 @@ int main(int argc, char *argv[])
 
         diku_resolve_graph_global(ctx, area);
 
-        if ((i + 1) % 10 == 0 || i == count - 1) {
+        if (verbose && ((i + 1) % 10 == 0 || i == count - 1)) {
             printf("  [%d/%d] %s  ->  R:%d M:%d O:%d\n",
                    i + 1, count, files[i],
                    area->room_count, area->mobile_count, area->item_count);

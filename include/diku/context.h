@@ -23,6 +23,7 @@ diku_context_t *diku_context_create(void);
 void            diku_context_destroy(diku_context_t *ctx);
 void            diku_context_set_progress(diku_context_t *ctx,
                                           diku_progress_cb_t cb, void *user);
+void            diku_context_set_verbose(diku_context_t *ctx, bool verbose);
 
 #ifdef DIKU_PARSER_IMPLEMENTATION
 
@@ -36,6 +37,7 @@ struct diku_context_t {
         bool valid;
     } coord_bounds;
     uint32_t             flags;
+    bool                 verbose;
 };
 
 diku_context_t *diku_context_create(void) {
@@ -56,6 +58,11 @@ void diku_context_set_progress(diku_context_t *ctx,
     if (!ctx) return;
     ctx->progress_cb = cb;
     ctx->progress_user = user;
+}
+
+void diku_context_set_verbose(diku_context_t *ctx, bool verbose) {
+    if (!ctx) return;
+    ctx->verbose = verbose;
 }
 
 #endif /* DIKU_PARSER_IMPLEMENTATION */

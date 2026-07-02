@@ -389,6 +389,14 @@ void diku_context_set_progress(diku_context_t *ctx,
 
 Set a progress callback on the context. The callback is invoked during folder loading operations. Pass `NULL` for `cb` to clear.
 
+### `diku_context_set_verbose`
+
+```c
+void diku_context_set_verbose(diku_context_t *ctx, bool verbose);
+```
+
+Set the verbose flag on the context. When enabled, the library may emit additional diagnostic output (for example, progress information during long operations). By default the context is non-verbose.
+
 ---
 
 ## Lexer
@@ -1205,6 +1213,7 @@ public:
     explicit operator bool() const noexcept;
 
     void set_progress(diku_progress_cb_t cb, void* user = nullptr) noexcept;
+    void set_verbose(bool verbose = true) noexcept;
 };
 ```
 

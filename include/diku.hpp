@@ -52,6 +52,10 @@ public:
     void set_progress(diku_progress_cb_t cb, void* user = nullptr) noexcept {
         diku_context_set_progress(ptr_.get(), cb, user);
     }
+
+    void set_verbose(bool verbose = true) noexcept {
+        diku_context_set_verbose(ptr_.get(), verbose);
+    }
 };
 
 /* ------------------------------------------------------------------ */

@@ -81,8 +81,12 @@ area_t *diku_parse_lexer(diku_lexer_t *lex, const char *filename) {
                 } else if (c == '0' || c == EOF) { break; }
                 else { diku_lexer_seek(lex, pos); diku_lexer_skip_line(lex); continue; }
                 room_t *room = diku_parse_room(lex, arena, &vnum);
+#ifdef DIKU_VERBOSE
                 if (!room) { fprintf(stderr, "diku_parse_room NULL at pos %ld\n", diku_lexer_tell(lex)); break; }
                 fprintf(stderr, "ROOM #%d %s\n", vnum, room->name.str ? room->name.str : "");
+#else
+                if (!room) break;
+#endif
                 if (area->room_count >= room_capacity) {
                     room_capacity *= 2;
                     room_t *nr = (room_t *)diku_arena_alloc_aligned(arena, sizeof(room_t) * room_capacity, 64);

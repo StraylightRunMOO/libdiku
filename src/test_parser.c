@@ -124,7 +124,7 @@ int main(int argc, char *argv[])
     area_t *areas = NULL;
 
     if (is_directory(filename)) {
-        diku_context_set_progress(ctx, progress_cb, NULL);
+        if (verbose) diku_context_set_progress(ctx, progress_cb, NULL);
         if (load_packages) {
             areas = diku_load_folder_packages(ctx, filename);
         } else {
