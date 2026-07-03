@@ -1025,7 +1025,7 @@ Heuristic to find a good root room for coordinate assignment. Prefers the room w
 void diku_assign_coordinates(diku_context_t *ctx, area_t *area, room_t *root);
 ```
 
-Assign 3D coordinates to all rooms in an area via BFS starting from `root`. Uses collision detection with spiral search. Stores bounds in `ctx->coord_bounds`.
+Assign 3D coordinates to all rooms in an area via BFS starting from `root`. Uses collision detection with spiral search. Stores bounds in `ctx->coord_bounds`. After assignment, shifts coordinates so the room nearest the centroid is at the origin.
 
 ### `diku_assign_coordinates_all`
 
@@ -1041,7 +1041,7 @@ Assign coordinates to each area in a linked list independently, using `diku_find
 void diku_assign_coordinates_multi(diku_context_t *ctx, area_t *areas);
 ```
 
-Assign coordinates across all areas in a linked list as a single connected graph.
+Assign coordinates across all areas in a linked list as a single connected graph. After assignment, shifts coordinates so the room nearest the global centroid is at the origin.
 
 ### `diku_room_at_coord`
 
@@ -1065,7 +1065,23 @@ Check if any room (other than `exclude`) occupies the given coordinates.
 void diku_center_coordinates(area_t *area);
 ```
 
-Shift all assigned coordinates so their centroid is at the origin.
+Shift all assigned coordinates so their centroid (average) is at the origin.
+
+### `diku_center_coordinates_on_centroid`
+
+```c
+void diku_center_coordinates_on_centroid(area_t *area);
+```
+
+Builds a kd-tree of assigned room coordinates, finds the room closest to the centroid, and shifts all coordinates so that room is at `(0, 0, 0)`. The kd-tree is managed by **libspatial**.
+
+### `diku_center_coordinates_on_centroid_all`
+
+```c
+void diku_center_coordinates_on_centroid_all(area_t *areas);
+```
+
+Same as `diku_center_coordinates_on_centroid()`, but operates on every area in a linked list as one global coordinate system.
 
 ### `diku_get_coord_bounds`
 

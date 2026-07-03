@@ -21,7 +21,7 @@ cmake ..
 make -j
 ```
 
-CMake automatically fetches the **Memento** allocator via FetchContent.
+CMake automatically fetches the **Memento** allocator and **libspatial** spatial indexing library via FetchContent.
 
 ### Build Targets
 

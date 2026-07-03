@@ -18,8 +18,12 @@ bool diku_coord_occupied(area_t *area, int x, int y, int z, room_t *exclude);
 void diku_center_coordinates(area_t *area);
 void diku_get_coord_bounds(area_t *area, int *min_x, int *max_x,
                            int *min_y, int *max_y, int *min_z, int *max_z);
+void diku_center_coordinates_on_centroid(area_t *area);
+void diku_center_coordinates_on_centroid_all(area_t *areas);
 
 #ifdef DIKU_PARSER_IMPLEMENTATION
+
+#include <libspatial/kdtree.h>
 
 room_t *diku_find_central_room(area_t *area) {
     if (!area || area->room_count == 0) return NULL;
@@ -232,6 +236,7 @@ static void diku_run_coord_bfs(diku_context_t *ctx, area_t *area, room_t *root,
 void diku_assign_coordinates(diku_context_t *ctx, area_t *area, room_t *root) {
     if (!ctx || !area || !root) return;
     diku_run_coord_bfs(ctx, area, root, area->room_count, false);
+    diku_center_coordinates_on_centroid(area);
 }
 
 void diku_assign_coordinates_all(diku_context_t *ctx, area_t *areas) {
@@ -261,6 +266,7 @@ void diku_assign_coordinates_multi(diku_context_t *ctx, area_t *areas) {
     if (!root && areas->room_count > 0) root = &areas->rooms[0];
     if (!root) return;
     diku_run_coord_bfs(ctx, areas, root, total_rooms, true);
+    diku_center_coordinates_on_centroid_all(areas);
 }
 
 bool diku_coord_occupied(area_t *area, int x, int y, int z, room_t *exclude) {
@@ -339,6 +345,122 @@ void diku_get_coord_bounds(area_t *area, int *min_x, int *max_x,
             if (area->rooms[i].coord.y > *max_y) *max_y = area->rooms[i].coord.y;
             if (area->rooms[i].coord.z < *min_z) *min_z = area->rooms[i].coord.z;
             if (area->rooms[i].coord.z > *max_z) *max_z = area->rooms[i].coord.z;
+        }
+    }
+}
+
+static room_t *diku_find_nearest_to_centroid_with_kdtree(area_t *area,
+                                                         spatial_num_t cx,
+                                                         spatial_num_t cy,
+                                                         spatial_num_t cz) {
+    if (!area || area->room_count == 0) return NULL;
+    spatial_kdtree *kt = spatial_kdtree_new();
+    if (!kt) return NULL;
+    for (int i = 0; i < area->room_count; i++) {
+        if (!area->rooms[i].coord_assigned) continue;
+        spatial_num_t min[3] = {
+            (spatial_num_t)area->rooms[i].coord.x,
+            (spatial_num_t)area->rooms[i].coord.y,
+            (spatial_num_t)area->rooms[i].coord.z
+        };
+        spatial_num_t max[3] = {
+            (spatial_num_t)area->rooms[i].coord.x,
+            (spatial_num_t)area->rooms[i].coord.y,
+            (spatial_num_t)area->rooms[i].coord.z
+        };
+        spatial_kdtree_insert(kt, min, max, &area->rooms[i]);
+    }
+    spatial_num_t query[3] = { cx, cy, cz };
+    void *results[1] = { NULL };
+    spatial_num_t distances[1] = { (spatial_num_t)0 };
+    spatial_kdtree_nearest(kt, query, 1, NULL, NULL, results, distances);
+    spatial_kdtree_free(kt);
+    return (room_t *)results[0];
+}
+
+void diku_center_coordinates_on_centroid(area_t *area) {
+    if (!area || area->room_count == 0) return;
+    long sum_x = 0, sum_y = 0, sum_z = 0;
+    int count = 0;
+    for (int i = 0; i < area->room_count; i++) {
+        if (area->rooms[i].coord_assigned) {
+            sum_x += area->rooms[i].coord.x;
+            sum_y += area->rooms[i].coord.y;
+            sum_z += area->rooms[i].coord.z;
+            count++;
+        }
+    }
+    if (count == 0) return;
+    spatial_num_t cx = (spatial_num_t)sum_x / (spatial_num_t)count;
+    spatial_num_t cy = (spatial_num_t)sum_y / (spatial_num_t)count;
+    spatial_num_t cz = (spatial_num_t)sum_z / (spatial_num_t)count;
+    room_t *nearest = diku_find_nearest_to_centroid_with_kdtree(area, cx, cy, cz);
+    if (!nearest) return;
+    int dx = nearest->coord.x;
+    int dy = nearest->coord.y;
+    int dz = nearest->coord.z;
+    for (int i = 0; i < area->room_count; i++) {
+        if (area->rooms[i].coord_assigned) {
+            area->rooms[i].coord.x -= dx;
+            area->rooms[i].coord.y -= dy;
+            area->rooms[i].coord.z -= dz;
+        }
+    }
+}
+
+void diku_center_coordinates_on_centroid_all(area_t *areas) {
+    if (!areas) return;
+    long sum_x = 0, sum_y = 0, sum_z = 0;
+    int count = 0;
+    for (area_t *area = areas; area; area = area->next) {
+        for (int i = 0; i < area->room_count; i++) {
+            if (area->rooms[i].coord_assigned) {
+                sum_x += area->rooms[i].coord.x;
+                sum_y += area->rooms[i].coord.y;
+                sum_z += area->rooms[i].coord.z;
+                count++;
+            }
+        }
+    }
+    if (count == 0) return;
+    spatial_num_t cx = (spatial_num_t)sum_x / (spatial_num_t)count;
+    spatial_num_t cy = (spatial_num_t)sum_y / (spatial_num_t)count;
+    spatial_num_t cz = (spatial_num_t)sum_z / (spatial_num_t)count;
+    spatial_kdtree *kt = spatial_kdtree_new();
+    if (!kt) return;
+    for (area_t *area = areas; area; area = area->next) {
+        for (int i = 0; i < area->room_count; i++) {
+            if (!area->rooms[i].coord_assigned) continue;
+            spatial_num_t min[3] = {
+                (spatial_num_t)area->rooms[i].coord.x,
+                (spatial_num_t)area->rooms[i].coord.y,
+                (spatial_num_t)area->rooms[i].coord.z
+            };
+            spatial_num_t max[3] = {
+                (spatial_num_t)area->rooms[i].coord.x,
+                (spatial_num_t)area->rooms[i].coord.y,
+                (spatial_num_t)area->rooms[i].coord.z
+            };
+            spatial_kdtree_insert(kt, min, max, &area->rooms[i]);
+        }
+    }
+    spatial_num_t query[3] = { cx, cy, cz };
+    void *results[1] = { NULL };
+    spatial_num_t distances[1] = { (spatial_num_t)0 };
+    spatial_kdtree_nearest(kt, query, 1, NULL, NULL, results, distances);
+    room_t *nearest = (room_t *)results[0];
+    spatial_kdtree_free(kt);
+    if (!nearest) return;
+    int dx = nearest->coord.x;
+    int dy = nearest->coord.y;
+    int dz = nearest->coord.z;
+    for (area_t *area = areas; area; area = area->next) {
+        for (int i = 0; i < area->room_count; i++) {
+            if (area->rooms[i].coord_assigned) {
+                area->rooms[i].coord.x -= dx;
+                area->rooms[i].coord.y -= dy;
+                area->rooms[i].coord.z -= dz;
+            }
         }
     }
 }

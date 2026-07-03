@@ -19,11 +19,22 @@ set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(memento)
 
+FetchContent_Declare(
+    libspatial
+    GIT_REPOSITORY https://github.com/kevinfling/libspatial.git
+    GIT_TAG master
+)
+set(LIBSPATIAL_USE_MEMENTO OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(libspatial)
+
 # Interface library (header-only C consumption)
 # Interface library (header-only C consumption)
 add_library(diku INTERFACE)
 target_include_directories(diku INTERFACE
-    include ${memento_SOURCE_DIR}/include)
+    include ${memento_SOURCE_DIR}/include ${libspatial_SOURCE_DIR}/include)
 target_link_libraries(diku INTERFACE m memento)
 target_compile_features(diku INTERFACE c_std_11)
 set_target_properties(diku PROPERTIES OUTPUT_NAME "libdiku")
