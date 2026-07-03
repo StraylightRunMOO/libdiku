@@ -7,6 +7,7 @@
 #include "diku/context.h"
 #include "diku/lexer.h"
 #include "diku/util.h"
+#include "diku/schema.h"
 #include "diku/find.h"
 #include "diku/resets.h"
 #include "diku/sections.h"

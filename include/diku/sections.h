@@ -3,6 +3,7 @@
 
 #include "diku/lexer.h"
 #include "diku/find.h"
+#include "diku/schema.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +34,115 @@ static bool parse_header_line(area_t *area, diku_lexer_t *lex, char letter, meme
     }
 }
 
+static bool is_area_section_word(const char *word) {
+    if (!word || !*word) return false;
+    if (strcmp(word, "$") == 0) return true;
+    if (isdigit((unsigned char)word[0])) return true;
+    return strcmp(word, "ROOMS") == 0 || strcmp(word, "ROOM") == 0 ||
+           strcmp(word, "MOBILES") == 0 || strcmp(word, "MOBILE") == 0 ||
+           strcmp(word, "OBJECTS") == 0 || strcmp(word, "OBJECT") == 0 ||
+           strcmp(word, "OBJ") == 0 || strcmp(word, "HELPS") == 0 ||
+           strcmp(word, "RESETS") == 0 || strcmp(word, "RESET") == 0 ||
+           strcmp(word, "SHOPS") == 0 || strcmp(word, "SHOP") == 0 ||
+           strcmp(word, "SPECIALS") == 0 || strcmp(word, "SPECIAL") == 0 ||
+           strcmp(word, "OBJFUNS") == 0 || strcmp(word, "OBJFUN") == 0 ||
+           strcmp(word, "PROGS") == 0 || strcmp(word, "REPAIRS") == 0;
+}
+
+static diku_string_t diku_extract_tilded_name(memento_arena_t *arena, const char *line) {
+    diku_string_t result = {NULL, 0};
+    const char *start = line;
+    while (*start && isspace((unsigned char)*start)) start++;
+    const char *tilde = strchr(start, '~');
+    if (!tilde) return result;
+    size_t len = (size_t)(tilde - start);
+    while (len > 0 && (start[len - 1] == '\r' || start[len - 1] == '\n' ||
+                       start[len - 1] == ' '  || start[len - 1] == '\t'))
+        len--;
+    return diku_arena_strndup(arena, start, len);
+}
+
+/* For compact ROM/Merc headers like "{low high} Author   Area Name~" the area
+   name follows the (single-word) author. Skip the author if more tokens follow. */
+static diku_string_t diku_extract_area_name_from_credits(memento_arena_t *arena, const char *line) {
+    diku_string_t full = diku_extract_tilded_name(arena, line);
+    if (!full.str || full.len == 0) return full;
+    /* Count whitespace-separated tokens. */
+    int tokens = 0;
+    const char *p = full.str;
+    const char *end = full.str + full.len;
+    while (p < end) {
+        while (p < end && isspace((unsigned char)*p)) p++;
+        if (p >= end) break;
+        tokens++;
+        while (p < end && !isspace((unsigned char)*p)) p++;
+    }
+    if (tokens <= 1) return full;
+    /* Skip the first token (author) and return the rest as area name. */
+    p = full.str;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    while (p < end && !isspace((unsigned char)*p)) p++;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    size_t len = (size_t)(end - p);
+    while (len > 0 && isspace((unsigned char)p[len - 1])) len--;
+    return diku_arena_strndup(arena, p, len);
+}
+
+static void parse_smaug_header(area_t *area, diku_lexer_t *lex, memento_arena_t *arena) {
+    char buf[256];
+    while (diku_lexer_read_line(lex, buf, sizeof(buf))) {
+        char *p = buf;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '*') continue;
+        if (strncmp(p, "End", 3) == 0) break;
+
+        char key[64];
+        int n = 0;
+        while (*p && !isspace((unsigned char)*p) && n < 63) key[n++] = *p++;
+        key[n] = '\0';
+        if (n == 0) continue;
+        while (*p && isspace((unsigned char)*p)) p++;
+
+        if (strcmp(key, "Name") == 0) {
+            area->name = diku_extract_tilded_name(arena, p);
+        } else if (strcmp(key, "Builders") == 0) {
+            area->builders = diku_extract_tilded_name(arena, p);
+        } else if (strcmp(key, "VNUMs") == 0 || strcmp(key, "Vnums") == 0) {
+            int lo, hi;
+            if (sscanf(p, "%d %d", &lo, &hi) == 2) {
+                area->low_vnum = lo;
+                area->high_vnum = hi;
+            }
+        } else if (strcmp(key, "Credits") == 0) {
+            area->credits = diku_extract_tilded_name(arena, p);
+            if (area->credits.str) {
+                char *b = strchr(area->credits.str, '{');
+                if (b) sscanf(b + 1, "%d %d", &area->low_level, &area->high_level);
+            }
+        } else if (strcmp(key, "Security") == 0) {
+            area->security = atoi(p);
+        } else if (strcmp(key, "Version") == 0) {
+            area->version = atoi(p);
+        } else if (strcmp(key, "Duration") == 0) {
+            area->reset_interval = atoi(p);
+        } else if (strcmp(key, "Ranges") == 0) {
+            int lo_lvl, hi_lvl;
+            if (sscanf(p, "%d %d %*d %*d", &lo_lvl, &hi_lvl) >= 2) {
+                area->low_level = lo_lvl;
+                area->high_level = hi_lvl;
+            }
+        } else if (strcmp(key, "Levels") == 0) {
+            sscanf(p, "%d %d", &area->low_level, &area->high_level);
+        }
+    }
+}
+
+static bool parse_rom_level_range(const char *line, int *low, int *high) {
+    const char *b = strchr(line, '{');
+    if (!b) return false;
+    return sscanf(b + 1, "%d %d", low, high) == 2;
+}
+
 area_t *diku_parse_area_header(diku_lexer_t *lex, memento_arena_t *arena) {
     area_t *area = (area_t *)diku_arena_alloc_aligned(arena, sizeof(area_t), 64);
     if (!area) return NULL;
@@ -42,21 +152,60 @@ area_t *diku_parse_area_header(diku_lexer_t *lex, memento_arena_t *arena) {
     char buf[256];
     if (!diku_lexer_read_line(lex, buf, sizeof(buf))) return NULL;
 
-    if (strstr(buf, "AREA") || strstr(buf, "#AREA")) {
-        char *name_start = strchr(buf, ' ');
-        if (name_start) {
-            name_start++;
-            char *tilde = strchr(name_start, '~');
-            if (tilde) {
-                *tilde = '\0';
-                size_t len = strlen(name_start);
-                while (len > 0 && (name_start[len-1] == '\n' || name_start[len-1] == '\r'))
-                    name_start[--len] = '\0';
-                area->name = diku_arena_strndup(arena, name_start, len);
+    /* SMAUG keyword header. */
+    if (strstr(buf, "#AREADATA")) {
+        
+        parse_smaug_header(area, lex, arena);
+    }
+    /* Standard #AREA header (Diku/Merc/ROM variants). */
+    else if (strstr(buf, "#AREA") || strstr(buf, "AREA")) {
+        char *brace = strchr(buf, '{');
+        if (brace) {
+            /* Compact ROM header: #AREA {low high} credits~ */
+            
+            parse_rom_level_range(buf, &area->low_level, &area->high_level);
+            char *close = strchr(brace, '}');
+            area->name = diku_extract_area_name_from_credits(arena, close ? close + 1 : brace + 1);
+        } else {
+            /* Inline area name on the #AREA line, e.g. "#AREA   Asgard~". */
+            char *name_start = strchr(buf, ' ');
+            if (name_start) {
+                name_start++;
+                while (*name_start && isspace((unsigned char)*name_start)) name_start++;
+                area->name = diku_extract_tilded_name(arena, name_start);
             }
         }
-        if (!area->name.str || area->name.len == 0)
+
+        if (!area->name.str || area->name.len == 0) {
+            /* Read the file-name line (e.g. "haon.are~") and discard it. */
+            diku_lexer_read_string(lex, arena);
+            /* Read the real area name. */
             area->name = diku_lexer_read_string(lex, arena);
+        }
+
+        /* ROM adds a {low high} credits line after the name. */
+        long pos = diku_lexer_tell(lex);
+        char peek[256];
+        if (diku_lexer_read_line(lex, peek, sizeof(peek))) {
+            char *p = peek;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p == '{') {
+                
+                parse_rom_level_range(peek, &area->low_level, &area->high_level);
+                if (!area->credits.str)
+                    area->credits = diku_extract_tilded_name(arena, p);
+                /* Next line should be the vnum range. */
+                if (diku_lexer_read_number(lex, &area->low_vnum) == 0)
+                    diku_lexer_read_number(lex, &area->high_vnum);
+            } else if (isdigit((unsigned char)*p)) {
+                /* Could be ROM/Merc vnum range, or old Diku continuation. */
+                diku_lexer_seek(lex, pos);
+                if (diku_lexer_read_number(lex, &area->low_vnum) == 0)
+                    diku_lexer_read_number(lex, &area->high_vnum);
+            } else {
+                diku_lexer_seek(lex, pos);
+            }
+        }
     }
 
     int c;
@@ -66,17 +215,51 @@ area_t *diku_parse_area_header(diku_lexer_t *lex, memento_arena_t *arena) {
             long hash_pos = diku_lexer_tell(lex) - 1;
             char peek[16];
             if (diku_lexer_read_word(lex, peek, 16)) {
-                if (strcmp(peek, "ROOMS") == 0 || strcmp(peek, "MOBILES") == 0 ||
-                    strcmp(peek, "OBJECTS") == 0 || strcmp(peek, "HELPS") == 0 ||
-                    strcmp(peek, "RESETS") == 0 || strcmp(peek, "SHOPS") == 0 ||
-                    strcmp(peek, "SPECIALS") == 0 || strcmp(peek, "OBJFUNS") == 0 ||
-                    strcmp(peek, "$") == 0 || isdigit(peek[0])) {
+                if (is_area_section_word(peek)) {
                     diku_lexer_seek(lex, hash_pos);
                     break;
-                } else {
-                    diku_lexer_skip_line(lex);
+                }
+                if (strcmp(peek, "AREA") == 0 || strcmp(peek, "AREADATA") == 0) {
+                    /* A late #AREA block (e.g. after a #Labeled line). */
+                    diku_lexer_seek(lex, hash_pos);
+                    char buf[256];
+                    if (diku_lexer_read_line(lex, buf, sizeof(buf))) {
+                        if (strstr(buf, "#AREADATA")) {
+                            
+                            parse_smaug_header(area, lex, arena);
+                        } else if (strstr(buf, "#AREA")) {
+                            char *brace = strchr(buf, '{');
+                            if (brace) {
+                                
+                                parse_rom_level_range(buf, &area->low_level, &area->high_level);
+                                char *close = strchr(brace, '}');
+                                area->name = diku_extract_area_name_from_credits(arena, close ? close + 1 : brace + 1);
+                            } else {
+                                diku_lexer_read_string(lex, arena); /* filename */
+                                area->name = diku_lexer_read_string(lex, arena);
+                                long pos2 = diku_lexer_tell(lex);
+                                char peek2[256];
+                                if (diku_lexer_read_line(lex, peek2, sizeof(peek2))) {
+                                    char *p2 = peek2;
+                                    while (*p2 && isspace((unsigned char)*p2)) p2++;
+                                    if (*p2 == '{') {
+                                        
+                                        parse_rom_level_range(peek2, &area->low_level, &area->high_level);
+                                        if (!area->credits.str)
+                                            area->credits = diku_extract_tilded_name(arena, p2);
+                                        diku_lexer_read_number(lex, &area->low_vnum);
+                                        diku_lexer_read_number(lex, &area->high_vnum);
+                                    } else {
+                                        diku_lexer_seek(lex, pos2);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
+                diku_lexer_skip_line(lex);
+                continue;
             }
         }
         if (isspace(c)) continue;
@@ -140,25 +323,15 @@ room_t *diku_parse_room(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out
                     diku_lexer_ungetc(lex, c2);
                     if (isalpha((unsigned char)c2)) {
                         if (diku_lexer_read_word(lex, token2, 64)) {
-                            uint32_t flags = 0;
-                            for (int i = 0; token2[i]; i++) {
-                                if (token2[i] >= 'A' && token2[i] <= 'Z')      flags |= (1U << (token2[i] - 'A'));
-                                else if (token2[i] >= 'a' && token2[i] <= 'z') flags |= (1U << (26 + token2[i] - 'a'));
-                            }
-                            room->flags = flags;
+                            room->flags = diku_decode_bitvector(token2);
                             diku_lexer_read_number(lex, &room->sector);
                         }
                     } else {
                         diku_lexer_seek(lex, after_t1);
                         if (isdigit(token1[0]) || token1[0] == '-') {
-                            room->flags = (uint32_t)strtol(token1, NULL, 0);
+                            room->flags = diku_parse_numeric_flags(token1);
                         } else {
-                            uint32_t flags = 0;
-                            for (int i = 0; token1[i]; i++) {
-                                if (token1[i] >= 'A' && token1[i] <= 'Z')      flags |= (1U << (token1[i] - 'A'));
-                                else if (token1[i] >= 'a' && token1[i] <= 'z') flags |= (1U << (26 + token1[i] - 'a'));
-                            }
-                            room->flags = flags;
+                            room->flags = diku_decode_bitvector(token1);
                         }
                         diku_lexer_read_number(lex, &room->sector);
                     }
@@ -226,19 +399,37 @@ mobile_t *diku_parse_mobile(diku_lexer_t *lex, memento_arena_t *arena, int *vnum
     diku_string_t desc = diku_lexer_read_string(lex, arena);
     if (desc.len > 0) mob->description = desc;
 
+    /* ROM/SMAUG mobiles have a race keyword line (e.g. "human~") before the
+       act flags. Consume it if present. */
     diku_lexer_skip_ws(lex);
+    long race_pos = diku_lexer_tell(lex);
+    const char *p = lex->pos;
+    bool race_found = false;
+    while (p < lex->end && !isspace((unsigned char)*p) && *p != '~') {
+        if (!isalpha((unsigned char)*p)) break;
+        p++;
+    }
+    if (p < lex->end && *p == '~') {
+        /* The next token is a tilde-terminated alphabetic word: race. */
+        diku_lexer_seek(lex, race_pos);
+        diku_lexer_read_string(lex, arena); /* consume race */
+        diku_lexer_skip_ws(lex);
+    } else {
+        diku_lexer_seek(lex, race_pos);
+    }
+
     char buf[256];
 
     if (diku_lexer_read_word(lex, buf, 255)) {
         uint32_t flags = 0;
-        if (isdigit(buf[0]) || buf[0] == '-') { flags = (uint32_t)strtol(buf, NULL, 0); }
-        else { for (int i = 0; buf[i]; i++) { if (buf[i] >= 'A' && buf[i] <= 'Z') flags |= (1U << (buf[i]-'A')); else if (buf[i] >= 'a' && buf[i] <= 'z') flags |= (1U << (26+buf[i]-'a')); } }
+        if (isdigit(buf[0]) || buf[0] == '-') { flags = diku_parse_numeric_flags(buf); }
+        else { flags = diku_decode_bitvector(buf); }
         mob->act_flags = flags;
     }
     if (diku_lexer_read_word(lex, buf, 255)) {
         uint32_t flags = 0;
-        if (isdigit(buf[0]) || buf[0] == '-') { flags = (uint32_t)strtol(buf, NULL, 0); }
-        else { for (int i = 0; buf[i]; i++) { if (buf[i] >= 'A' && buf[i] <= 'Z') flags |= (1U << (buf[i]-'A')); else if (buf[i] >= 'a' && buf[i] <= 'z') flags |= (1U << (26+buf[i]-'a')); } }
+        if (isdigit(buf[0]) || buf[0] == '-') { flags = diku_parse_numeric_flags(buf); }
+        else { flags = diku_decode_bitvector(buf); }
         mob->aff_flags = flags;
     }
 
@@ -319,8 +510,33 @@ item_t *diku_parse_item(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out
         else if (isdigit(desc_peek) || desc_peek == '#' || desc_peek == '0') { diku_lexer_ungetc(lex, desc_peek); }
         else {
             diku_lexer_ungetc(lex, desc_peek);
-            diku_string_t desc = diku_lexer_read_string(lex, arena);
-            if (desc.len > 0) item->description = desc;
+            diku_string_t maybe = diku_lexer_read_string(lex, arena);
+            if (maybe.len > 0) {
+                /* ROM items place a single-word material (e.g. "iron~") between
+                   the long description and the type line. If the next token is a
+                   valid item type, treat this string as material. */
+                bool single_word = true;
+                for (size_t i = 0; i < maybe.len; i++) {
+                    if (isspace((unsigned char)maybe.str[i])) { single_word = false; break; }
+                }
+                diku_lexer_skip_ws(lex);
+                char type_test[64];
+                long after_str = diku_lexer_tell(lex);
+                bool next_is_type = false;
+                if (diku_lexer_read_word(lex, type_test, 64)) {
+                    if (isdigit(type_test[0]) || type_test[0] == '-') {
+                        next_is_type = true;
+                    } else if (diku_item_type_from_name(type_test) != 0) {
+                        next_is_type = true;
+                    }
+                    diku_lexer_seek(lex, after_str);
+                }
+                if (single_word && next_is_type) {
+                    item->material = maybe;
+                } else {
+                    item->description = maybe;
+                }
+            }
         }
     }
 
@@ -335,19 +551,26 @@ item_t *diku_parse_item(diku_lexer_t *lex, memento_arena_t *arena, int *vnum_out
     if (boundary_c != EOF) diku_lexer_ungetc(lex, boundary_c);
 
     diku_lexer_skip_ws(lex);
-    diku_lexer_read_number(lex, &item->type);
+    char type_buf[256];
+    if (diku_lexer_read_word(lex, type_buf, 255)) {
+        if (isdigit(type_buf[0]) || type_buf[0] == '-') {
+            item->type = (int)strtol(type_buf, NULL, 0);
+        } else {
+            item->type = diku_item_type_from_name(type_buf);
+        }
+    }
 
     char buf[256];
     if (diku_lexer_read_word(lex, buf, 255)) {
         uint32_t flags = 0;
-        if (isdigit(buf[0]) || buf[0] == '-') { flags = (uint32_t)strtol(buf, NULL, 0); }
-        else { for (int i = 0; buf[i]; i++) { if (buf[i] >= 'A' && buf[i] <= 'Z') flags |= (1U << (buf[i]-'A')); else if (buf[i] >= 'a' && buf[i] <= 'z') flags |= (1U << (26+buf[i]-'a')); } }
+        if (isdigit(buf[0]) || buf[0] == '-') { flags = diku_parse_numeric_flags(buf); }
+        else { flags = diku_decode_bitvector(buf); }
         item->extra_flags = flags;
     }
     if (diku_lexer_read_word(lex, buf, 255)) {
         uint32_t flags = 0;
-        if (isdigit(buf[0]) || buf[0] == '-') { flags = (uint32_t)strtol(buf, NULL, 0); }
-        else { for (int i = 0; buf[i]; i++) { if (buf[i] >= 'A' && buf[i] <= 'Z') flags |= (1U << (buf[i]-'A')); else if (buf[i] >= 'a' && buf[i] <= 'z') flags |= (1U << (26+buf[i]-'a')); } }
+        if (isdigit(buf[0]) || buf[0] == '-') { flags = diku_parse_numeric_flags(buf); }
+        else { flags = diku_decode_bitvector(buf); }
         item->wear_flags = flags;
     }
     diku_lexer_skip_line(lex);

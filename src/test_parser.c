@@ -22,6 +22,7 @@ static void print_usage(const char *prog)
     printf("  --coords            Select 3D coordinates\n");
     printf("  --symmetry          Show exit symmetry report\n");
     printf("  --packages          When loading a directory, load multi-file packages\n");
+    printf("  --format            Show detected fork format for each area\n");
     printf("  -h, --help          Show this help\n");
     printf("\nWithout -v, an overview summary is printed.\n");
 }
@@ -78,6 +79,7 @@ int main(int argc, char *argv[])
     bool show_graph = false;
     bool show_coords = false;
     bool show_symmetry = false;
+    bool show_format = false;
     bool load_packages = false;
 
     for (int i = 1; i < argc; i++) {
@@ -100,6 +102,8 @@ int main(int argc, char *argv[])
                 show_symmetry = true;
             } else if (strcmp(argv[i], "--packages") == 0) {
                 load_packages = true;
+            } else if (strcmp(argv[i], "--format") == 0) {
+                show_format = true;
             } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
                 print_usage(argv[0]);
                 return 0;
@@ -249,6 +253,15 @@ int main(int argc, char *argv[])
         diku_totals_t totals = {0};
         diku_compute_totals(areas, &totals);
         diku_print_totals(stdout, &totals, filename, areas);
+        if (show_format) {
+            printf("\n--- Detected Formats ---\n");
+            for (area_t *a = areas; a; a = a->next) {
+                printf("  %-30s  %s\n",
+                       a->name.str && a->name.len > 0 ? a->name.str : "(unnamed)",
+                       diku_format_name(a->format));
+            }
+            printf("------------------------\n");
+        }
         if (show_symmetry) {
             printf("\n");
             diku_print_exit_symmetry(areas);

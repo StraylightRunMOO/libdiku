@@ -198,6 +198,7 @@ typedef struct area_t {
     int low_level, high_level, low_vnum, high_vnum;
     int security, version, reset_interval;
     diku_string_t ambient_sound, owner, reset_msg, weather, pay_info, teleport_info, magic_info;
+    diku_format_t format;       /* detected fork (DIKU_FMT_*) */
 
     room_t *rooms; int room_count;
     room_t **rooms_by_vnum;     /* vnum hash for O(1) lookup */
@@ -893,7 +894,70 @@ Dispatch based on file type: regular file → `diku_parse_file`, directory → `
 diku_format_t diku_detect_format(const area_t *area);
 ```
 
-Heuristically detect which MUD fork produced the area file.
+Heuristically detect which MUD fork produced the area file. After parsing, the
+result is also stored in `area->format`.
+
+---
+
+## Schema / Fork Mapping
+
+**Header:** `diku/schema.h`
+
+`diku/schema.h` exposes a universal schema of canonical constants and conversion
+helpers so that flags and values can be interpreted independently of the source
+fork.
+
+### Fork enum
+
+```c
+typedef enum {
+    DIKU_FMT_UNKNOWN = 0,
+    DIKU_FMT_DIKU,
+    DIKU_FMT_MERC,
+    DIKU_FMT_ROM,
+    DIKU_FMT_CIRCLE,
+    DIKU_FMT_SMAUG,
+    DIKU_FMT_CUSTOM
+} diku_format_t;
+```
+
+### Detection helpers
+
+```c
+diku_format_t diku_sniff_format(const char *buf, size_t len);
+diku_format_t diku_classify_area(const area_t *area);
+```
+
+`diku_sniff_format` performs lightweight pre-parse classification from the raw
+file buffer. `diku_classify_area` refines the guess after parsing using populated
+`area_t` data.
+
+### Bitvector decoder
+
+```c
+uint32_t diku_decode_bitvector(const char *s);   /* A=1<<0, B=1<<1, ... */
+uint32_t diku_parse_numeric_flags(const char *s); /* handles 2|512 */
+```
+
+### Canonical flag conversions
+
+```c
+uint32_t diku_canonical_room_flags(diku_format_t fmt, uint32_t native);
+uint32_t diku_canonical_act_flags(diku_format_t fmt, uint32_t native);
+uint32_t diku_canonical_affect_flags(diku_format_t fmt, uint32_t native);
+uint32_t diku_canonical_wear_flags(diku_format_t fmt, uint32_t native);
+uint32_t diku_canonical_extra_flags(diku_format_t fmt, uint32_t native);
+```
+
+### Canonical constants
+
+- Room flags: `DIKU_ROOM_DARK`, `DIKU_ROOM_NO_MOB`, `DIKU_ROOM_INDOORS`, ...
+- Mobile act flags: `DIKU_ACT_IS_NPC`, `DIKU_ACT_SENTINEL`, ...
+- Affect flags: `DIKU_AFF_BLIND`, `DIKU_AFF_INVISIBLE`, ...
+- Wear flags: `DIKU_WEAR_TAKE`, `DIKU_WEAR_WIELD`, ...
+- Extra flags: `DIKU_EXTRA_GLOW`, `DIKU_EXTRA_HUM`, ...
+- Item types: `DIKU_ITEM_WEAPON`, `DIKU_ITEM_ARMOR`, ...
+- Sector types: `DIKU_SECT_FOREST`, `DIKU_SECT_CITY`, ...
 
 ---
 

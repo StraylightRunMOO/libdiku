@@ -111,12 +111,26 @@ struct item_t {
     void *user;
 } __attribute__((aligned(64)));
 
+/* ------------------------------------------------------------------ */
+/* Fork detection enum                                                */
+/* ------------------------------------------------------------------ */
+typedef enum {
+    DIKU_FMT_UNKNOWN = 0,
+    DIKU_FMT_DIKU,
+    DIKU_FMT_MERC,
+    DIKU_FMT_ROM,
+    DIKU_FMT_CIRCLE,
+    DIKU_FMT_SMAUG,
+    DIKU_FMT_CUSTOM
+} diku_format_t;
+
 typedef struct area_t area_t;
 struct area_t {
     diku_string_t name, filename, builders, credits;
     int low_level, high_level, low_vnum, high_vnum;
     int security, version, reset_interval;
     diku_string_t ambient_sound, owner, reset_msg, weather, pay_info, teleport_info, magic_info;
+    diku_format_t format;
     room_t *rooms; int room_count;
     room_t **rooms_by_vnum;
     mobile_t *mobiles; int mobile_count;
@@ -164,19 +178,6 @@ struct diku_lexer_t {
     int         col;
     bool        owns_buf;
 };
-
-/* ------------------------------------------------------------------ */
-/* Fork detection enum                                                */
-/* ------------------------------------------------------------------ */
-typedef enum {
-    DIKU_FMT_UNKNOWN = 0,
-    DIKU_FMT_DIKU,
-    DIKU_FMT_MERC,
-    DIKU_FMT_ROM,
-    DIKU_FMT_CIRCLE,
-    DIKU_FMT_SMAUG,
-    DIKU_FMT_CUSTOM
-} diku_format_t;
 
 #ifdef __cplusplus
 }

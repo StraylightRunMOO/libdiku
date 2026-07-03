@@ -87,6 +87,7 @@ int main(int argc, char *argv[])
 
     int passed = 0;
     int total_rooms = 0, total_mobiles = 0, total_items = 0, total_exits = 0;
+    int fmt_counts[DIKU_FMT_CUSTOM + 1] = {0};
 
     for (int i = 0; i < count; i++) {
         area_t *area = diku_parse_file(ctx, files[i]);
@@ -110,6 +111,8 @@ int main(int argc, char *argv[])
         total_rooms += area->room_count;
         total_mobiles += area->mobile_count;
         total_items += area->item_count;
+        if (area->format >= DIKU_FMT_UNKNOWN && area->format <= DIKU_FMT_CUSTOM)
+            fmt_counts[area->format]++;
 
         for (int r = 0; r < area->room_count; r++) {
             for (int d = 0; d < DIKU_MAX_EXITS; d++) {
@@ -119,14 +122,18 @@ int main(int argc, char *argv[])
 
         diku_resolve_graph_global(ctx, area);
 
-        if (verbose && ((i + 1) % 10 == 0 || i == count - 1)) {
-            printf("  [%d/%d] %s  ->  R:%d M:%d O:%d\n",
-                   i + 1, count, files[i],
+        if (verbose) {
+            printf("  [%d/%d] %-40s  %-8s  R:%4d M:%4d O:%4d\n",
+                   i + 1, count, files[i], diku_format_name(area->format),
                    area->room_count, area->mobile_count, area->item_count);
+        } else if ((i + 1) % 10 == 0 || i == count - 1) {
+            printf("\r  Parsing %d/%d...", i + 1, count);
+            fflush(stdout);
         }
 
         diku_free_all_areas(area);
     }
+    if (!verbose) printf("\r  Parsing %d/%d...\n", count, count);
 
     printf("\n========================================\n");
     printf("SUCCESS: All %d files parsed!\n", count);
@@ -135,6 +142,12 @@ int main(int argc, char *argv[])
     printf("Total mobiles parsed:  %d\n", total_mobiles);
     printf("Total items parsed:    %d\n", total_items);
     printf("Total exits parsed:    %d\n", total_exits);
+    printf("\nDetected formats:\n");
+    for (int f = DIKU_FMT_UNKNOWN; f <= DIKU_FMT_CUSTOM; f++) {
+        if (fmt_counts[f] > 0) {
+            printf("  %-10s  %d\n", diku_format_name((diku_format_t)f), fmt_counts[f]);
+        }
+    }
     printf("========================================\n");
 
     for (int i = 0; i < count; i++) free(files[i]);

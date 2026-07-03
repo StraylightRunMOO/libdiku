@@ -4,6 +4,7 @@
 #include "diku/sections.h"
 #include "diku/resets.h"
 #include "diku/context.h"
+#include "diku/schema.h"
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -57,6 +58,7 @@ area_t *diku_parse_lexer(diku_lexer_t *lex, const char *filename) {
     if (!area) { diku_arena_free_all(arena); return NULL; }
 
     area->filename = diku_arena_strndup(arena, filename, strlen(filename));
+    area->format = diku_sniff_format(lex->buf, (size_t)(lex->end - lex->buf));
 
     char buf[256];
     while (diku_lexer_read_word(lex, buf, 255)) {
@@ -171,6 +173,11 @@ area_t *diku_parse_lexer(diku_lexer_t *lex, const char *filename) {
 
     diku_build_vnum_hash(area);
     diku_parse_resets(area);
+
+    diku_format_t classified = diku_classify_area(area);
+    if (diku_format_priority(classified) > diku_format_priority(area->format))
+        area->format = classified;
+
     return area;
 }
 
@@ -289,10 +296,13 @@ area_t *diku_parse_path(diku_context_t *ctx, const char *path) {
 
 diku_format_t diku_detect_format(const area_t *area) {
     if (!area) return DIKU_FMT_UNKNOWN;
+    /* If the parser already determined a fork, use it. */
+    if (area->format != DIKU_FMT_UNKNOWN) return area->format;
+    /* Fallback heuristic for areas created outside the parser. */
     for (int i = 0; i < area->mobile_count; i++)
         if (area->mobiles[i].material.len > 0) return DIKU_FMT_ROM;
     for (int i = 0; i < area->item_count; i++)
-        if (area->items[i].material.len > 0 || area->items[i].level > 0) return DIKU_FMT_ROM;
+        if (area->items[i].material.len > 0) return DIKU_FMT_ROM;
     if (area->security > 0 || area->version > 0) return DIKU_FMT_SMAUG;
     if (area->room_count > 0 && area->mobile_count > 0) return DIKU_FMT_MERC;
     return DIKU_FMT_DIKU;
