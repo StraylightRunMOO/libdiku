@@ -11,7 +11,7 @@ static void print_usage(const char *prog)
     printf("\nPath can be:\n");
     printf("  <area_file.are>     A single area file\n");
     printf("  <package_base>      Base path to a classic .wld/.mob/.obj/.zon package\n");
-    printf("  <directory>         Load all .are files (or packages with --packages)\n");
+    printf("  <directory>         Load all .are files and CircleMUD packages\n");
     printf("\nOptions:\n");
     printf("  -v, --verbose       Verbose mode: page through selected entities\n");
     printf("  --all               Select all entities (default with -v)\n");
@@ -21,7 +21,7 @@ static void print_usage(const char *prog)
     printf("  --graph             Select graph connections\n");
     printf("  --coords            Select 3D coordinates\n");
     printf("  --symmetry          Show exit symmetry report\n");
-    printf("  --packages          When loading a directory, load multi-file packages\n");
+    printf("  --packages          Deprecated: packages are loaded automatically\n");
     printf("  --format            Show detected fork format for each area\n");
     printf("  -h, --help          Show this help\n");
     printf("\nWithout -v, an overview summary is printed.\n");
@@ -80,7 +80,6 @@ int main(int argc, char *argv[])
     bool show_coords = false;
     bool show_symmetry = false;
     bool show_format = false;
-    bool load_packages = false;
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] == '-') {
@@ -101,7 +100,7 @@ int main(int argc, char *argv[])
             } else if (strcmp(argv[i], "--symmetry") == 0) {
                 show_symmetry = true;
             } else if (strcmp(argv[i], "--packages") == 0) {
-                load_packages = true;
+                /* no-op: packages are loaded automatically for directories */
             } else if (strcmp(argv[i], "--format") == 0) {
                 show_format = true;
             } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -129,12 +128,19 @@ int main(int argc, char *argv[])
 
     if (is_directory(filename)) {
         if (verbose) diku_context_set_progress(ctx, progress_cb, NULL);
-        if (load_packages) {
-            areas = diku_load_folder_packages(ctx, filename);
-        } else {
-            areas = diku_load_folder_are(ctx, filename);
-        }
+        area_t *are_areas = diku_load_folder_are(ctx, filename);
+        area_t *pkg_areas = diku_load_folder_packages(ctx, filename);
         diku_context_set_progress(ctx, NULL, NULL);
+        if (are_areas && pkg_areas) {
+            area_t *tail = are_areas;
+            while (tail->next) tail = tail->next;
+            tail->next = pkg_areas;
+            areas = are_areas;
+        } else if (are_areas) {
+            areas = are_areas;
+        } else {
+            areas = pkg_areas;
+        }
     } else {
         areas = diku_parse_file(ctx, filename);
     }

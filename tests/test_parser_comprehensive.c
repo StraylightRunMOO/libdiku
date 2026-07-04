@@ -42,6 +42,44 @@ static void collect_are_files(const char *base_path, char ***files, int *count)
     closedir(dir);
 }
 
+static int ends_with(const char *s, const char *suffix)
+{
+    size_t sl = strlen(s), tl = strlen(suffix);
+    if (sl < tl) return 0;
+    return strcasecmp(s + sl - tl, suffix) == 0;
+}
+
+static void collect_package_bases(const char *base_path, char ***bases, int *count)
+{
+    DIR *dir = opendir(base_path);
+    if (!dir) return;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+
+        size_t path_len = strlen(base_path) + 1 + strlen(entry->d_name) + 1;
+        char *full_path = malloc(path_len);
+        snprintf(full_path, path_len, "%s/%s", base_path, entry->d_name);
+
+        struct stat st;
+        if (stat(full_path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                collect_package_bases(full_path, bases, count);
+            } else if (ends_with(entry->d_name, ".wld")) {
+                size_t len = strlen(full_path);
+                full_path[len - 4] = '\0'; /* strip .wld to get base path */
+                *bases = realloc(*bases, (*count + 1) * sizeof(char *));
+                (*bases)[*count] = full_path;
+                (*count)++;
+                full_path = NULL;
+            }
+        }
+        if (full_path) free(full_path);
+    }
+    closedir(dir);
+}
+
 int main(int argc, char *argv[])
 {
     bool verbose = false;
@@ -62,20 +100,25 @@ int main(int argc, char *argv[])
 #endif
 
     char **files = NULL;
-    int count = 0;
+    int file_count = 0;
+    char **packages = NULL;
+    int package_count = 0;
     for (int f = 0; f < folder_count; f++) {
-        collect_are_files(folders[f], &files, &count);
+        collect_are_files(folders[f], &files, &file_count);
+        collect_package_bases(folders[f], &packages, &package_count);
     }
 
+    int count = file_count + package_count;
     if (count == 0) {
-        fprintf(stderr, "No .are files found\n");
+        fprintf(stderr, "No .are files or CircleMUD packages found\n");
         return 0;
     }
 
-    qsort(files, count, sizeof(char *), compare_strings);
+    qsort(files, file_count, sizeof(char *), compare_strings);
+    qsort(packages, package_count, sizeof(char *), compare_strings);
 
     if (verbose) {
-        printf("Found %d .are files\n", count);
+        printf("Found %d .are files and %d CircleMUD packages\n", file_count, package_count);
         printf("Loading until failure...\n\n");
     }
 
@@ -90,19 +133,23 @@ int main(int argc, char *argv[])
     int fmt_counts[DIKU_FMT_CUSTOM + 1] = {0};
 
     for (int i = 0; i < count; i++) {
-        area_t *area = diku_parse_file(ctx, files[i]);
+        bool is_package = (i >= file_count);
+        const char *path = is_package ? packages[i - file_count] : files[i];
+        area_t *area = is_package ? diku_parse_package(ctx, path) : diku_parse_file(ctx, path);
         if (!area) {
             printf("\n========================================\n");
-            printf("FAILURE on file %d/%d: %s\n", i + 1, count, files[i]);
+            printf("FAILURE on %s %d/%d: %s\n", is_package ? "package" : "file", i + 1, count, path);
             printf("========================================\n");
-            printf("Successfully parsed before failure: %d files\n", passed);
+            printf("Successfully parsed before failure: %d\n", passed);
             printf("Total rooms parsed:    %d\n", total_rooms);
             printf("Total mobiles parsed:  %d\n", total_mobiles);
             printf("Total items parsed:    %d\n", total_items);
             printf("Total exits parsed:    %d\n", total_exits);
             printf("========================================\n");
-            for (int j = 0; j < count; j++) free(files[j]);
+            for (int j = 0; j < file_count; j++) free(files[j]);
+            for (int j = 0; j < package_count; j++) free(packages[j]);
             free(files);
+            free(packages);
             diku_context_destroy(ctx);
             return 1;
         }
@@ -124,7 +171,7 @@ int main(int argc, char *argv[])
 
         if (verbose) {
             printf("  [%d/%d] %-40s  %-8s  R:%4d M:%4d O:%4d\n",
-                   i + 1, count, files[i], diku_format_name(area->format),
+                   i + 1, count, path, diku_format_name(area->format),
                    area->room_count, area->mobile_count, area->item_count);
         } else if ((i + 1) % 10 == 0 || i == count - 1) {
             printf("\r  Parsing %d/%d...", i + 1, count);
@@ -150,8 +197,10 @@ int main(int argc, char *argv[])
     }
     printf("========================================\n");
 
-    for (int i = 0; i < count; i++) free(files[i]);
+    for (int i = 0; i < file_count; i++) free(files[i]);
+    for (int i = 0; i < package_count; i++) free(packages[i]);
     free(files);
+    free(packages);
     diku_context_destroy(ctx);
     return 0;
 }

@@ -208,6 +208,7 @@ area_t *diku_parse_package_files(const char *wld, const char *mob, const char *o
     { diku_lexer_t fl; if (diku_lexer_init_file(&fl, zon)) { if (diku_parse_zon(&fl, area)) has_data = true; diku_lexer_cleanup(&fl); } }
 
     if (!has_data) { diku_free_area(area); return NULL; }
+    area->format = DIKU_FMT_CIRCLE;
     diku_build_vnum_hash(area);
     return area;
 }
