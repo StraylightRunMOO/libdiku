@@ -230,57 +230,92 @@ area_t *diku_parse_package(diku_context_t *ctx, const char *base_path) {
     return area;
 }
 
-area_t *diku_load_folder_are(diku_context_t *ctx, const char *folder_path) {
-    DIR *dir = opendir(folder_path);
-    if (!dir) return NULL;
-    struct dirent *entry;
-    int total = 0;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t len = strlen(entry->d_name);
-        if (len > 4 && strcasecmp(entry->d_name + len - 4, ".are") == 0) total++;
+typedef struct {
+    char **paths;
+    int count;
+    int capacity;
+} diku_path_list_t;
+
+static bool diku_path_list_add(diku_path_list_t *list, const char *path) {
+    if (list->count >= list->capacity) {
+        int new_cap = list->capacity ? list->capacity * 2 : 16;
+        char **new_paths = (char **)realloc(list->paths, new_cap * sizeof(char *));
+        if (!new_paths) return false;
+        list->paths = new_paths;
+        list->capacity = new_cap;
     }
-    rewinddir(dir);
-    area_t *head = NULL, *tail = NULL;
-    int current = 0;
+    size_t len = strlen(path);
+    list->paths[list->count] = (char *)malloc(len + 1);
+    if (!list->paths[list->count]) return false;
+    memcpy(list->paths[list->count], path, len + 1);
+    list->count++;
+    return true;
+}
+
+static void diku_path_list_free(diku_path_list_t *list) {
+    for (int i = 0; i < list->count; i++) free(list->paths[i]);
+    free(list->paths);
+    list->paths = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void diku_collect_files_recursive(const char *folder_path, const char *suffix, diku_path_list_t *list) {
+    DIR *dir = opendir(folder_path);
+    if (!dir) return;
+    struct dirent *entry;
+    size_t suffix_len = strlen(suffix);
     while ((entry = readdir(dir)) != NULL) {
-        size_t len = strlen(entry->d_name);
-        if (len <= 4 || strcasecmp(entry->d_name + len - 4, ".are") != 0) continue;
-        char path[4096];
-        snprintf(path, sizeof(path), "%s/%s", folder_path, entry->d_name);
-        diku_fmt_progress(ctx, "parse_are", current, total, path);
-        area_t *area = diku_parse_file(ctx, path);
-        if (area) { if (!head) head = tail = area; else { tail->next = area; tail = area; } }
-        current++;
+        if (entry->d_name[0] == '.') continue;
+        size_t path_len = strlen(folder_path) + 1 + strlen(entry->d_name) + 1;
+        char *full_path = (char *)malloc(path_len);
+        if (!full_path) continue;
+        snprintf(full_path, path_len, "%s/%s", folder_path, entry->d_name);
+        struct stat st;
+        if (stat(full_path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                diku_collect_files_recursive(full_path, suffix, list);
+            } else {
+                size_t name_len = strlen(entry->d_name);
+                if (name_len > suffix_len && strcasecmp(entry->d_name + name_len - suffix_len, suffix) == 0) {
+                    if (!diku_path_list_add(list, full_path)) {
+                        free(full_path);
+                    }
+                }
+            }
+        }
+        free(full_path);
     }
     closedir(dir);
-    diku_fmt_progress(ctx, "parse_are", total, total, "done");
+}
+
+area_t *diku_load_folder_are(diku_context_t *ctx, const char *folder_path) {
+    diku_path_list_t list = {0};
+    diku_collect_files_recursive(folder_path, ".are", &list);
+    area_t *head = NULL, *tail = NULL;
+    for (int i = 0; i < list.count; i++) {
+        diku_fmt_progress(ctx, "parse_are", i, list.count, list.paths[i]);
+        area_t *area = diku_parse_file(ctx, list.paths[i]);
+        if (area) { if (!head) head = tail = area; else { tail->next = area; tail = area; } }
+    }
+    diku_fmt_progress(ctx, "parse_are", list.count, list.count, "done");
+    diku_path_list_free(&list);
     return head;
 }
 
 area_t *diku_load_folder_packages(diku_context_t *ctx, const char *folder_path) {
-    DIR *dir = opendir(folder_path);
-    if (!dir) return NULL;
-    struct dirent *entry;
-    int total = 0;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t len = strlen(entry->d_name);
-        if (len > 4 && strcasecmp(entry->d_name + len - 4, ".wld") == 0) total++;
-    }
-    rewinddir(dir);
+    diku_path_list_t list = {0};
+    diku_collect_files_recursive(folder_path, ".wld", &list);
     area_t *head = NULL, *tail = NULL;
-    int current = 0;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t len = strlen(entry->d_name);
-        if (len <= 4 || strcasecmp(entry->d_name + len - 4, ".wld") != 0) continue;
-        char base[4096];
-        snprintf(base, sizeof(base), "%s/%.*s", folder_path, (int)(len - 4), entry->d_name);
-        diku_fmt_progress(ctx, "parse_package", current, total, base);
-        area_t *area = diku_parse_package(ctx, base);
+    for (int i = 0; i < list.count; i++) {
+        size_t len = strlen(list.paths[i]);
+        if (len > 4) list.paths[i][len - 4] = '\0'; /* strip .wld to get base path */
+        diku_fmt_progress(ctx, "parse_package", i, list.count, list.paths[i]);
+        area_t *area = diku_parse_package(ctx, list.paths[i]);
         if (area) { if (!head) head = tail = area; else { tail->next = area; tail = area; } }
-        current++;
     }
-    closedir(dir);
-    diku_fmt_progress(ctx, "parse_package", total, total, "done");
+    diku_fmt_progress(ctx, "parse_package", list.count, list.count, "done");
+    diku_path_list_free(&list);
     return head;
 }
 
@@ -290,7 +325,14 @@ area_t *diku_parse_path(diku_context_t *ctx, const char *path) {
     if (S_ISREG(st.st_mode)) {
         return diku_parse_file(ctx, path);
     } else if (S_ISDIR(st.st_mode)) {
-        return diku_load_folder_are(ctx, path);
+        area_t *are = diku_load_folder_are(ctx, path);
+        area_t *pkg = diku_load_folder_packages(ctx, path);
+        if (!are) return pkg;
+        if (!pkg) return are;
+        area_t *tail = are;
+        while (tail->next) tail = tail->next;
+        tail->next = pkg;
+        return are;
     }
     return NULL;
 }
