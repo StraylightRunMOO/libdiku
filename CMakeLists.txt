@@ -58,3 +58,11 @@ target_link_libraries(mud_client PRIVATE diku_impl)
 # Comprehensive parser test
 add_executable(test_parser_comprehensive tests/test_parser_comprehensive.c)
 target_link_libraries(test_parser_comprehensive PRIVATE diku_impl)
+
+# Optional SQLite virtual-table extension (see examples/sqlite_vtab)
+option(DIKU_BUILD_SQLITE "Build the SQLite virtual-table extension" OFF)
+if(DIKU_BUILD_SQLITE)
+    find_package(SQLite3 REQUIRED)
+    enable_testing()
+    add_subdirectory(examples/sqlite_vtab)
+endif()
